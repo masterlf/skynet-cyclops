@@ -41,11 +41,11 @@ jobs:
       - name: Ruff format
         run: ruff format --check .
       - name: Mypy
-        run: mypy src
+        run: mypy src integrations/hermes-dashboard/skynet-cyclops/plugin_api.py scripts/public_repo_scan.py
       - name: Behavioral tests and branch coverage
         run: pytest --cov=skynet_cyclops --cov-report=term-missing
       - name: Bandit
-        run: bandit -r src -q
+        run: bandit -r src integrations scripts -q
       - name: Dependency audit
         run: pip-audit
       - name: Public repository scan

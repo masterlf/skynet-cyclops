@@ -44,7 +44,16 @@ def valid_status() -> dict[str, Any]:
                 "manifest_sha256": "a" * 64,
                 "outcome": "running",
                 "next_phase": "review",
-                "phases": [{"key": "review", "state": "review", "evidence_present": []}],
+                "phases": [
+                    {
+                        "key": "review",
+                        "state": "review",
+                        "task_id": "task-1",
+                        "assignee": "reviewer",
+                        "evidence_present": [],
+                        "retry_count": 0,
+                    }
+                ],
                 "workers": [
                     {
                         "task_id": "task-1",
@@ -99,6 +108,25 @@ def test_dashboard_api_rejects_symlink_oversize_and_unknown_fields(tmp_path: Pat
     real.write_text(json.dumps(poisoned), encoding="utf-8")
     with pytest.raises(module.StatusUnavailable):
         module.read_status(real)
+
+
+def test_dashboard_shares_producer_contract_and_disables_caching(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = load_dashboard_api()
+    from skynet_cyclops.projection import validate_projection
+
+    payload = valid_status()
+    assert module._validate_status(payload) == validate_projection(payload)
+    poisoned = valid_status()
+    poisoned["missions"][0]["workers"][0]["retry_count"] = "prose"
+    with pytest.raises(module.StatusUnavailable):
+        module._validate_status(poisoned)
+    path = tmp_path / "status.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    path.chmod(0o600)
+    monkeypatch.setattr(module, "_configured_status_path", lambda: path)
+    assert module.get_status().headers["cache-control"] == "no-store"
 
 
 def test_dashboard_bundle_executes_with_sdk_and_is_read_only() -> None:
@@ -202,6 +230,11 @@ def test_public_scanner_accepts_safe_and_rejects_sensitive_fixtures(tmp_path: Pa
         "home.txt": "/ho" + "me/private-user/file\n",
         "ip.txt": "connect " + "10." + "2.3.4\n",
         "key.txt": "-----BEGIN " + "PRIVATE KEY-----\n",
+        "dsa.txt": "-----BEGIN DSA " + "PRIVATE KEY-----\n",
+        "encrypted.txt": "-----BEGIN ENCRYPTED " + "PRIVATE KEY-----\n",
+        "pgp.txt": "-----BEGIN PGP " + "PRIVATE KEY BLOCK-----\n",
+        "mac-home.txt": "/Users/" + "private-user/file\n",
+        "windows-home.txt": "C:\\Users\\" + "private-user\\file\n",
         "token.txt": "AKIA" + "A" * 16 + "\n",
     }
     for name, value in cases.items():
@@ -226,6 +259,12 @@ def test_public_scanner_permissions_symlinks_and_size(tmp_path: Path) -> None:
     assert run_scanner(tmp_path).returncode != 0
 
 
+def test_public_scanner_ignores_git_pointer_file(tmp_path: Path) -> None:
+    (tmp_path / ".git").write_text("gitdir: /synthetic/worktree/metadata\n", encoding="utf-8")
+    (tmp_path / "safe.txt").write_text("safe\n", encoding="utf-8")
+    assert run_scanner(tmp_path).returncode == 0
+
+
 def test_systemd_and_installer_static_contract() -> None:
     service = (REPO / "packaging/systemd/skynet-cyclops.service").read_text(encoding="utf-8")
     timer = (REPO / "packaging/systemd/skynet-cyclops.timer").read_text(encoding="utf-8")
@@ -234,8 +273,43 @@ def test_systemd_and_installer_static_contract() -> None:
     assert "ExecStart=/usr/bin/env skynet-cyclops" in service
     assert "NoNewPrivileges=true" in service and "ProtectSystem=strict" in service
     assert "OnUnitActiveSec=120s" in timer and "Persistent=false" in timer
+    assert "RandomizedDelaySec=" in timer and "ConditionPathExists=" in service
     assert "--apply" in installer and "dry-run" in installer
     assert "enable --now" not in installer
     assert "HERMES" not in installer.upper()
     mode = stat.S_IMODE((REPO / "scripts/install-user.sh").stat().st_mode)
     assert mode & stat.S_IXUSR
+
+
+def test_installer_preserves_operator_config_and_installs_manifest(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    environment = {
+        **os.environ,
+        "HOME": str(home),
+        "XDG_CONFIG_HOME": str(home / ".config"),
+        "XDG_STATE_HOME": str(home / ".local" / "state"),
+    }
+    script = REPO / "scripts" / "install-user.sh"
+    first = subprocess.run(  # noqa: S603 - fixed repository-owned installer path
+        [str(script), "--apply"],
+        shell=False,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert first.returncode == 0, first.stderr
+    config = home / ".config" / "skynet-cyclops" / "config.yaml"
+    mission = home / ".config" / "skynet-cyclops" / "mission.yaml"
+    assert config.is_file() and mission.is_file()
+    config.write_text("operator-edit\n", encoding="utf-8")
+    second = subprocess.run(  # noqa: S603 - fixed repository-owned installer path
+        [str(script), "--apply"],
+        shell=False,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert second.returncode == 0, second.stderr
+    assert config.read_text(encoding="utf-8") == "operator-edit\n"

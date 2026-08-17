@@ -28,9 +28,10 @@ def test_ci_matrix_and_required_release_gates_are_explicit() -> None:
         'python -m pip install --upgrade "pip>=26.1.2"',
         "ruff check .",
         "ruff format --check .",
-        "mypy src",
+        "mypy src integrations/hermes-dashboard/skynet-cyclops/plugin_api.py "
+        "scripts/public_repo_scan.py",
         "pytest --cov=skynet_cyclops --cov-report=term-missing",
-        "bandit -r src -q",
+        "bandit -r src integrations scripts -q",
         "pip-audit",
         "python scripts/public_repo_scan.py .",
         "python -m build",

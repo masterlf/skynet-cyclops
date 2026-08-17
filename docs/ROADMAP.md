@@ -16,7 +16,7 @@ The project ships observation before actuation. Each later capability requires a
 - public repository privacy/secret scan;
 - zero-LLM nominal-path tests.
 
-The candidate has no repair, manager wake, alert delivery, token accounting, publishing, or deployment path. Phase runtime and retry bounds are declared for operator context but remain owned and enforced by Hermes in v0.1.
+The candidate has no repair, manager wake, alert delivery, token accounting, publishing, or deployment path. Bootstrap forwards phase runtime, retry, and goal declarations to Hermes; Cyclops does not implement a second runtime or retry engine.
 
 ## v0.2 — Bounded deterministic repairs
 

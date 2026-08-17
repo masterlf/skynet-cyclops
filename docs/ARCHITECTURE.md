@@ -18,11 +18,11 @@ release manifest ──► bootstrap ──► Hermes Kanban (canonical)
 
 ### Manifest
 
-The manifest is immutable runtime intent: mission ID, phases, dependencies, roles, evidence requirements, tick cadence, gap damper, and declared phase runtime/retry bounds. v0.1 reports workflow state but does not enforce phase runtime or retry policy; Hermes remains the sole retry authority. The manifest does not contain commands or runtime status.
+The manifest is immutable runtime intent: mission ID, phases, dependencies, roles, evidence requirements, tick cadence, gap damper, and phase runtime/retry/goal declarations. Bootstrap forwards those declarations to Hermes card creation; Hermes enforces runtime and retry behavior and remains the sole retry authority. The manifest does not contain commands or runtime status.
 
 ### Bootstrap
 
-Bootstrap validates the complete graph before creating cards. Creation uses deterministic idempotency keys and supported Hermes CLI calls. `--dry-run` is the default posture; `--apply` is explicit.
+Bootstrap validates the complete graph before creating cards. Creation uses deterministic idempotency keys, a bounded machine-readable card contract, and supported Hermes CLI calls. Apply holds a private cross-process exclusive lock, rejects ambiguous or mismatched cards, creates every card blocked, verifies the complete graph, and then promotes roots. `--dry-run` is the default posture; `--apply` is explicit.
 
 ### Kanban
 
@@ -73,7 +73,7 @@ A phase is derived from its bound task and dependencies:
 - `review`: reviewer phase active;
 - `blocked`: external or technical gate;
 - `failed`: terminal unsuccessful condition;
-- `done`: completed with required evidence metadata;
+- `done`: completed with required truthy evidence metadata from the latest successful terminal run;
 - `unknown`: malformed, missing or contradictory input.
 
 Unknown fails closed. Mission success requires the final phase and final evidence contract.

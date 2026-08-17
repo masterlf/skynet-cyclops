@@ -158,7 +158,7 @@ def parse_manifest(data: object) -> Manifest:
             Phase(
                 key=_string(raw["key"], f"phases[{index}].key", 64, identifier=True),
                 kind=kind,
-                title=_string(raw["title"], f"phases[{index}].title", 200),
+                title=_phase_title(raw["title"], f"phases[{index}].title"),
                 assignee=_string(raw["assignee"], f"phases[{index}].assignee", 64, identifier=True),
                 depends_on=_string_list(
                     raw["depends_on"], f"phases[{index}].depends_on", MAX_PHASES
@@ -227,12 +227,40 @@ def _validate_graph(manifest: Manifest) -> None:
         _fail("every phase must be reachable through mission.final_phase")
 
 
+def _phase_title(value: object, name: str) -> str:
+    title = _string(value, name, 200)
+    if title.startswith("-"):
+        _fail(f"{name} must not begin with a dash")
+    return title
+
+
+def topological_phases(manifest: Manifest) -> tuple[Phase, ...]:
+    """Return a stable dependency-first phase order."""
+    by_key = {phase.key: phase for phase in manifest.phases}
+    pending = {key: set(phase.depends_on) for key, phase in by_key.items()}
+    ordered: list[Phase] = []
+    completed: set[str] = set()
+    while pending:
+        ready = sorted(key for key, dependencies in pending.items() if dependencies <= completed)
+        if not ready:
+            _fail("phase graph cannot be ordered")
+        for key in ready:
+            ordered.append(by_key[key])
+            completed.add(key)
+            del pending[key]
+    return tuple(ordered)
+
+
 def load_manifest(path: str | os.PathLike[str]) -> Manifest:
     candidate = Path(path)
     try:
         info = candidate.lstat()
         if not stat.S_ISREG(info.st_mode) or candidate.is_symlink():
             _fail("manifest must be a regular file")
+        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+            _fail("manifest ownership is unsafe")
+        if stat.S_IMODE(info.st_mode) & 0o022:
+            _fail("manifest permissions are unsafe")
         if info.st_size > MAX_MANIFEST_BYTES:
             _fail("manifest is too large")
         text = candidate.read_text(encoding="utf-8")

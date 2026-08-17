@@ -45,6 +45,10 @@ def load_config(path: str | os.PathLike[str]) -> Config:
         info = candidate.lstat()
         if candidate.is_symlink() or not stat.S_ISREG(info.st_mode):
             raise ValidationError("configuration must be a regular file")
+        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+            raise ValidationError("configuration ownership is unsafe")
+        if stat.S_IMODE(info.st_mode) & 0o022:
+            raise ValidationError("configuration permissions are unsafe")
         if info.st_size > MAX_CONFIG_BYTES:
             raise ValidationError("configuration is too large")
         raw = yaml.safe_load(candidate.read_text(encoding="utf-8"))

@@ -11,6 +11,7 @@ from conftest import manifest_data
 
 from skynet_cyclops.adapter import (
     HermesAdapter,
+    ReadOnlyCollector,
     normalize_diagnostics,
     normalize_run_rows,
     normalize_task_rows,
@@ -113,6 +114,25 @@ def test_adapter_fails_closed_on_invalid_bounds_argv_and_unavailable_binary(
     assert "private executable detail" not in str(caught.value)
 
 
+def test_collection_deadline_and_read_only_facade(monkeypatch: pytest.MonkeyPatch) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        observed["timeout"] = kwargs["timeout"]
+        return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr("skynet_cyclops.adapter.time.monotonic", lambda: 100.0)
+    adapter = HermesAdapter(timeout_seconds=10, collection_timeout_seconds=30)
+    assert adapter._run(["profile", "show", "builder"], deadline=105.0) == "{}"
+    assert observed["timeout"] == 5.0
+    with pytest.raises(AdapterError, match="deadline"):
+        adapter._run(["profile", "show", "builder"], deadline=99.0)
+    facade = ReadOnlyCollector(adapter)
+    assert hasattr(facade, "collect")
+    assert not any(hasattr(facade, name) for name in ("create_task", "link_tasks", "promote_task"))
+
+
 def _raw_task(**changes: object) -> dict[str, object]:
     task: dict[str, object] = {
         "id": "task-1",
@@ -148,6 +168,67 @@ def test_task_normalization_preserves_only_bounded_metadata_and_marker() -> None
 
 
 @pytest.mark.parametrize(
+    "contract",
+    [
+        "",
+        "{",
+        "x" * 4097,
+        json.dumps({"schema_version": 1}),
+        json.dumps(
+            {
+                "schema_version": 1,
+                "phase_key": "bad key",
+                "kind": "implementation",
+                "goal_mode": False,
+                "max_runtime_seconds": 30,
+                "max_retries": 1,
+                "evidence_required": ["tests"],
+            }
+        ),
+        json.dumps(
+            {
+                "schema_version": 2,
+                "phase_key": "build",
+                "kind": "implementation",
+                "goal_mode": "no",
+                "max_runtime_seconds": True,
+                "max_retries": 1,
+                "evidence_required": "tests",
+            }
+        ),
+        json.dumps(
+            {
+                "schema_version": 1,
+                "phase_key": "build",
+                "kind": "implementation",
+                "goal_mode": False,
+                "max_runtime_seconds": 30,
+                "max_retries": 1,
+                "evidence_required": ["tests", "tests"],
+            }
+        ),
+        json.dumps(
+            {
+                "schema_version": 1,
+                "phase_key": "build",
+                "kind": "implementation",
+                "goal_mode": False,
+                "max_runtime_seconds": 30,
+                "max_retries": 1,
+                "evidence_required": ["bad evidence"],
+            }
+        ),
+    ],
+)
+def test_task_normalization_rejects_malformed_bootstrap_contract(contract: str) -> None:
+    row = normalize_task_rows(
+        [_raw_task(body=f"[cyclops-idempotency:cyclops-safe-key]\n{contract}")]
+    )[0]
+    assert row["bootstrap_key"] == "cyclops-safe-key"
+    assert "bootstrap_contract" not in row
+
+
+@pytest.mark.parametrize(
     "rows",
     [
         {},
@@ -177,14 +258,63 @@ def test_run_and_diagnostic_normalization_rejects_unbounded_or_ambiguous_data() 
     normalized = normalize_run_rows([_raw_run(metadata={"evidence": "not-a-container"})], "task-1")
     assert normalized[0]["_evidence"] == []
     normalized = normalize_run_rows(
-        [_raw_run(metadata={"evidence": ["tests", "tests", "../unsafe"]})], "task-1"
+        [
+            _raw_run(
+                status="done",
+                outcome="completed",
+                ended_at=2,
+                metadata={"evidence": ["tests", "tests", "../unsafe"]},
+            )
+        ],
+        "task-1",
     )
     assert normalized[0]["_evidence"] == ["tests"]
     normalized = normalize_run_rows(
-        [_raw_run(metadata={"evidence": {"commit": True}})],
+        [
+            _raw_run(
+                status="done",
+                outcome="completed",
+                ended_at=2,
+                metadata={"evidence": {"commit": True}},
+            )
+        ],
         "task-1",
     )
     assert normalized[0]["_evidence"] == ["commit"]
+    falsy = normalize_run_rows(
+        [
+            _raw_run(
+                status="done",
+                outcome="completed",
+                ended_at=2,
+                metadata={
+                    "evidence": {
+                        "none": None,
+                        "false": False,
+                        "empty_text": "",
+                        "empty_list": [],
+                        "empty_object": {},
+                        "zero": 0,
+                        "tests": True,
+                    }
+                },
+            )
+        ],
+        "task-1",
+    )
+    assert falsy[0]["_evidence"] == ["tests"]
+    failed = normalize_run_rows(
+        [
+            _raw_run(
+                status="failed",
+                outcome="crashed",
+                ended_at=2,
+                metadata={"evidence": {"stale": True}},
+            )
+        ],
+        "task-1",
+    )
+    assert failed[0]["_evidence"] == []
     for rows in ({}, [None], [_raw_run(), _raw_run()], [_raw_run(metadata={"x": {1}})]):
         with pytest.raises(ValidationError):
             normalize_run_rows(rows, "task-1")
@@ -211,6 +341,28 @@ def test_run_and_diagnostic_normalization_rejects_unbounded_or_ambiguous_data() 
         normalize_diagnostics([dict(raw_diagnostic, diagnostics="bad")])
     with pytest.raises(ValidationError):
         validate_diagnostic_collection([dict(redacted[0], diagnostic_count=True)])
+
+
+def test_run_evidence_parser_rejects_malformed_values() -> None:
+    rows = [
+        _raw_run(
+            id="run-1", status="done", outcome="completed", ended_at=1, metadata={"evidence": None}
+        ),
+        _raw_run(
+            id="run-2", status="done", outcome="completed", ended_at=1, metadata={"evidence": 1}
+        ),
+        _raw_run(
+            id="run-3", status="done", outcome="completed", ended_at=1, metadata={"evidence": [1]}
+        ),
+        _raw_run(
+            id="run-4",
+            status="done",
+            outcome="completed",
+            ended_at=1,
+            metadata={"evidence": ["bad key"]},
+        ),
+    ]
+    assert all(not row["_evidence"] for row in normalize_run_rows(rows, "task-1"))
 
 
 def test_adapter_matches_live_cli_shapes_and_exact_argv(
@@ -253,14 +405,14 @@ def test_adapter_matches_live_cli_shapes_and_exact_argv(
                 "id": "run-1",
                 "profile": "builder",
                 "step_key": None,
-                "status": "running",
-                "outcome": None,
+                "status": "done",
+                "outcome": "completed",
                 "summary": "discarded run summary",
                 "error": None,
                 "metadata": {"evidence": {"commit": "discarded", "tests": True}},
                 "worker_pid": 123,
                 "started_at": "2026-01-01T00:01:00Z",
-                "ended_at": None,
+                "ended_at": 1767225720,
             }
         ],
     }
@@ -298,7 +450,19 @@ def test_adapter_matches_live_cli_shapes_and_exact_argv(
     )
     adapter.preflight_profile("builder")
     collection = adapter.collect("default", ["task-1"])
-    created = adapter.create_task("default", "Create synthetic task", "builder", [], "cyclops-key")
+    created = adapter.create_task(
+        "default",
+        "Create synthetic task",
+        "builder",
+        [],
+        "cyclops-key",
+        kind="implementation",
+        max_runtime_seconds=600,
+        max_retries=2,
+        goal_mode=True,
+        evidence_required=["commit", "tests"],
+        phase_key="build",
+    )
     adapter.link_tasks("default", "task-1", "task-2")
     assert created == {"id": "task-2"}
     assert collection["tasks"][0]["evidence"] == ["commit", "tests"]  # type: ignore[index]
@@ -310,6 +474,21 @@ def test_adapter_matches_live_cli_shapes_and_exact_argv(
     assert "--body" in observed[3]
     assert observed[3][observed[3].index("--idempotency-key") + 1] == "cyclops-key"
     assert observed[3][observed[3].index("--initial-status") + 1] == "blocked"
+    assert observed[3][observed[3].index("--max-runtime") + 1] == "600"
+    assert observed[3][observed[3].index("--max-retries") + 1] == "2"
+    assert "--goal" in observed[3]
+    body = observed[3][observed[3].index("--body") + 1]
+    marker, contract = body.split("\n", 1)
+    assert marker == "[cyclops-idempotency:cyclops-key]"
+    assert json.loads(contract) == {
+        "schema_version": 1,
+        "phase_key": "build",
+        "kind": "implementation",
+        "goal_mode": True,
+        "max_runtime_seconds": 600,
+        "max_retries": 2,
+        "evidence_required": ["commit", "tests"],
+    }
     assert observed[4] == ["hermes", "kanban", "--board", "default", "link", "task-1", "task-2"]
 
 
@@ -334,7 +513,6 @@ def _task_detail() -> dict[str, object]:
 @pytest.mark.parametrize(
     "mutate",
     [
-        lambda value: value.update(extra=[]),
         lambda value: value.__setitem__("task", _raw_task(id="task-other")),
         lambda value: value.__setitem__("latest_summary", "x" * (64 * 1024 + 1)),
         lambda value: value.__setitem__("parents", "task-parent"),
@@ -365,7 +543,19 @@ def test_adapter_collection_and_mutation_responses_are_bound_and_fail_closed() -
     assert adapter.task_parents("default", "task-1") == []
     assert adapter.diagnostics("default") == []
     with pytest.raises(AdapterError, match="create response"):
-        adapter.create_task("default", "Synthetic", "builder", ["task-parent"], "cyclops-key")
+        adapter.create_task(
+            "default",
+            "Synthetic",
+            "builder",
+            ["task-parent"],
+            "cyclops-key",
+            phase_key="build",
+            kind="implementation",
+            goal_mode=False,
+            max_runtime_seconds=600,
+            max_retries=2,
+            evidence_required=["tests"],
+        )
     with pytest.raises(ValidationError, match="bound task"):
         adapter.collect("default", ["task-1", "task-1"])
     adapter.promote_task("default", "task-1")
@@ -373,6 +563,33 @@ def test_adapter_collection_and_mutation_responses_are_bound_and_fail_closed() -
     adapter.run_json = lambda _arguments: []  # type: ignore[method-assign]
     with pytest.raises(AdapterError, match="promote response"):
         adapter.promote_task("default", "task-1")
+
+
+def test_collection_never_uses_stale_or_failed_run_evidence() -> None:
+    detail = _task_detail()
+    detail["task"] = _raw_task(status="done")
+    detail["runs"] = [
+        _raw_run(
+            id=1,
+            status="done",
+            outcome="completed",
+            ended_at=2,
+            metadata={"evidence": {"stale": True}},
+        ),
+        _raw_run(
+            id=2,
+            status="failed",
+            outcome="crashed",
+            ended_at=3,
+            metadata={"evidence": {"failed": True}},
+        ),
+    ]
+    responses = [detail, []]
+    adapter = HermesAdapter()
+    adapter._run_json = lambda *_args, **_kwargs: responses.pop(0)  # type: ignore[method-assign]
+    collection = adapter.collect("default", ["task-1"])
+    assert collection["tasks"][0]["evidence"] == []  # type: ignore[index]
+    assert [run["id"] for run in collection["runs"]] == ["1", "2"]  # type: ignore[index]
 
 
 class FakeAdapter:
@@ -391,7 +608,19 @@ class FakeAdapter:
         return list(self.tasks)
 
     def create_task(
-        self, board: str, title: str, assignee: str, parents: list[str], idempotency_key: str
+        self,
+        board: str,
+        title: str,
+        assignee: str,
+        parents: list[str],
+        idempotency_key: str,
+        *,
+        phase_key: str,
+        kind: str,
+        goal_mode: bool,
+        max_runtime_seconds: int,
+        max_retries: int,
+        evidence_required: list[str],
     ) -> dict[str, Any]:
         self.calls.append(("create", board, idempotency_key, *parents))
         assert parents == []
@@ -401,6 +630,15 @@ class FakeAdapter:
             "assignee": assignee,
             "status": "blocked",
             "bootstrap_key": idempotency_key,
+            "bootstrap_contract": {
+                "schema_version": 1,
+                "phase_key": phase_key,
+                "kind": kind,
+                "goal_mode": goal_mode,
+                "max_runtime_seconds": max_runtime_seconds,
+                "max_retries": max_retries,
+                "evidence_required": sorted(evidence_required),
+            },
             "evidence": [],
             "retry_count": 0,
         }
@@ -431,6 +669,18 @@ class FakeAdapter:
         next(task for task in self.tasks if task["id"] == task_id)["status"] = "ready"
 
 
+def _item_contract(item: Any) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "phase_key": item.phase_key,
+        "kind": item.kind,
+        "goal_mode": item.goal_mode,
+        "max_runtime_seconds": item.max_runtime_seconds,
+        "max_retries": item.max_retries,
+        "evidence_required": list(item.evidence_required),
+    }
+
+
 def test_bootstrap_dry_run_default_has_no_calls() -> None:
     adapter = FakeAdapter()
     manifest = parse_manifest(manifest_data())
@@ -438,6 +688,18 @@ def test_bootstrap_dry_run_default_has_no_calls() -> None:
     assert [item.phase_key for item in plan] == ["build", "review", "verify"]
     assert adapter.calls == []
     assert len({item.idempotency_key for item in plan}) == 3
+    assert plan[0].to_dict() | {} == {
+        "phase_key": "build",
+        "title": "Build synthetic candidate",
+        "assignee": "builder",
+        "dependency_phases": [],
+        "idempotency_key": plan[0].idempotency_key,
+        "kind": "implementation",
+        "goal_mode": False,
+        "max_runtime_seconds": 600,
+        "max_retries": 2,
+        "evidence_required": ["commit", "tests"],
+    }
 
 
 def test_bootstrap_apply_is_idempotent_and_reconciles_response_loss(tmp_path: Path) -> None:
@@ -504,6 +766,7 @@ def test_bootstrap_reuses_preexisting_idempotent_card_without_duplicate_creation
             "assignee": first_item.assignee,
             "status": "blocked",
             "bootstrap_key": first_item.idempotency_key,
+            "bootstrap_contract": first_item.contract(),
         }
     )
     adapter.parents["task-1"] = []
@@ -511,6 +774,83 @@ def test_bootstrap_reuses_preexisting_idempotent_card_without_duplicate_creation
         bindings = apply_bootstrap(manifest, adapter, ledger)
     assert bindings["build"] == "task-1"
     assert len([call for call in adapter.calls if call[0] == "create"]) == 2
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"title": "Wrong title"},
+        {"assignee": "reviewer"},
+        {"status": "ready"},
+        {"bootstrap_contract": {"schema_version": 1}},
+    ],
+)
+def test_bootstrap_never_adopts_or_promotes_mismatched_preseeded_card(
+    tmp_path: Path, changes: dict[str, object]
+) -> None:
+    manifest = parse_manifest(manifest_data())
+    item = plan_bootstrap(manifest)[0]
+    adapter = FakeAdapter()
+    task = {
+        "id": "task-seeded",
+        "title": item.title,
+        "assignee": item.assignee,
+        "status": "blocked",
+        "bootstrap_key": item.idempotency_key,
+        "bootstrap_contract": _item_contract(item),
+    }
+    task.update(changes)
+    adapter.tasks.append(task)
+    adapter.parents["task-seeded"] = []
+    with (
+        Ledger.create(tmp_path / "ledger.db") as ledger,
+        pytest.raises(AdapterError, match="match"),
+    ):
+        apply_bootstrap(manifest, adapter, ledger)
+    assert adapter.promoted == []
+    with Ledger.open(tmp_path / "ledger.db") as ledger:
+        assert ledger.bindings(manifest.mission.id) == {}
+
+
+def test_bootstrap_rejects_ambiguous_preseeded_candidates_before_binding(tmp_path: Path) -> None:
+    manifest = parse_manifest(manifest_data())
+    item = plan_bootstrap(manifest)[0]
+    adapter = FakeAdapter()
+    for task_id in ("task-seeded-1", "task-seeded-2"):
+        adapter.tasks.append(
+            {
+                "id": task_id,
+                "title": item.title,
+                "assignee": item.assignee,
+                "status": "blocked",
+                "bootstrap_key": item.idempotency_key,
+                "bootstrap_contract": _item_contract(item),
+            }
+        )
+        adapter.parents[task_id] = []
+    with (
+        Ledger.create(tmp_path / "ledger.db") as ledger,
+        pytest.raises(AdapterError, match="ambiguous"),
+    ):
+        apply_bootstrap(manifest, adapter, ledger)
+    assert adapter.promoted == []
+
+
+def test_response_loss_reconciliation_rejects_mismatched_card(tmp_path: Path) -> None:
+    class MismatchingLostResponse(FakeAdapter):
+        def create_task(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            task = super().create_task(*args, **kwargs)
+            task["assignee"] = "reviewer"
+            raise AdapterError("response unavailable")
+
+    manifest = parse_manifest(manifest_data())
+    adapter = MismatchingLostResponse()
+    with (
+        Ledger.create(tmp_path / "ledger.db") as ledger,
+        pytest.raises(AdapterError, match="match"),
+    ):
+        apply_bootstrap(manifest, adapter, ledger)
+    assert adapter.promoted == []
 
 
 def test_bootstrap_rejects_ambiguous_create_reconciliation(tmp_path: Path) -> None:

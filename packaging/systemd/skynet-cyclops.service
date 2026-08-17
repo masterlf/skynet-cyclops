@@ -3,6 +3,7 @@
 Description=Skynet-Cyclops observe-only supervisor tick
 Documentation=https://github.com/masterlf/skynet-cyclops
 After=default.target
+ConditionPathExists=%h/.config/skynet-cyclops/config.yaml
 
 [Service]
 Type=oneshot

@@ -16,25 +16,138 @@ MAX_PROJECTION_BYTES = 256 * 1024
 _TOP_LEVEL = {"schema_version", "projection_version", "supervisor", "missions", "incidents", "cost"}
 
 
+def _safe_identifier(value: object) -> bool:
+    if not isinstance(value, str) or not 1 <= len(value) <= 128:
+        return False
+    return value[0].isalnum() and all(
+        character.isalnum() or character in "._:-" for character in value
+    )
+
+
+def _bounded_int(value: object, minimum: int = 0, maximum: int = 10**9) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and minimum <= value <= maximum
+
+
+def _validate_phase(value: object) -> None:
+    fields = {"key", "state", "task_id", "assignee", "evidence_present", "retry_count"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ProjectionError("status phase schema is invalid")
+    if not _safe_identifier(value["key"]) or value["state"] not in {
+        "pending",
+        "ready",
+        "running",
+        "review",
+        "blocked",
+        "failed",
+        "done",
+        "unknown",
+    }:
+        raise ProjectionError("status phase identity is invalid")
+    if value["task_id"] is not None and not _safe_identifier(value["task_id"]):
+        raise ProjectionError("status phase task is invalid")
+    if not _safe_identifier(value["assignee"]) or not _bounded_int(value["retry_count"], 0, 100):
+        raise ProjectionError("status phase metadata is invalid")
+    evidence = value["evidence_present"]
+    if (
+        not isinstance(evidence, list)
+        or len(evidence) > 32
+        or not all(_safe_identifier(item) for item in evidence)
+        or evidence != sorted(set(evidence))
+    ):
+        raise ProjectionError("status phase evidence is invalid")
+
+
+def _validate_worker(value: object) -> None:
+    fields = {"task_id", "run_id", "assignee", "status", "heartbeat_age_seconds", "retry_count"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ProjectionError("status worker schema is invalid")
+    if not all(_safe_identifier(value[key]) for key in ("task_id", "run_id", "assignee", "status")):
+        raise ProjectionError("status worker identity is invalid")
+    age = value["heartbeat_age_seconds"]
+    if age is not None and not _bounded_int(age):
+        raise ProjectionError("status worker heartbeat is invalid")
+    if not _bounded_int(value["retry_count"], 0, 100):
+        raise ProjectionError("status worker retry count is invalid")
+
+
+def _validate_mission(value: object) -> None:
+    fields = {"id", "manifest_sha256", "outcome", "next_phase", "phases", "workers"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ProjectionError("status mission schema is invalid")
+    if not _safe_identifier(value["id"]) or value["outcome"] not in {
+        "running",
+        "blocked",
+        "failed",
+        "done",
+        "unknown",
+    }:
+        raise ProjectionError("status mission identity is invalid")
+    digest = value["manifest_sha256"]
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(c not in "0123456789abcdef" for c in digest)
+    ):
+        raise ProjectionError("status manifest digest is invalid")
+    if value["next_phase"] is not None and not _safe_identifier(value["next_phase"]):
+        raise ProjectionError("status next phase is invalid")
+    phases = value["phases"]
+    workers = value["workers"]
+    if not isinstance(phases, list) or len(phases) > 64:
+        raise ProjectionError("status phases are invalid")
+    if not isinstance(workers, list) or len(workers) > 256:
+        raise ProjectionError("status workers are invalid")
+    for phase in phases:
+        _validate_phase(phase)
+    for worker in workers:
+        _validate_worker(worker)
+
+
+def _validate_incident(value: object) -> None:
+    fields = {"id", "phase_key", "kind", "severity", "age_ticks", "observed_ticks", "disposition"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ProjectionError("status incident schema is invalid")
+    if not all(_safe_identifier(value[key]) for key in ("id", "phase_key", "kind")):
+        raise ProjectionError("status incident identity is invalid")
+    if value["severity"] not in {"warning", "critical"} or value["disposition"] not in {
+        "observing",
+        "active",
+    }:
+        raise ProjectionError("status incident state is invalid")
+    if not _bounded_int(value["age_ticks"], 1) or not _bounded_int(value["observed_ticks"], 1):
+        raise ProjectionError("status incident counters are invalid")
+
+
 def validate_projection(value: object) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != _TOP_LEVEL:
         raise ProjectionError("status projection schema is invalid")
     if value.get("schema_version") != 1 or value.get("projection_version") != 1:
         raise ProjectionError("status projection version is unsupported")
     supervisor = value.get("supervisor")
-    allowed_supervisor = {"mode", "state", "heartbeat_at", "tick_seq", "post_gap"}
-    if not isinstance(supervisor, dict) or set(supervisor) != allowed_supervisor:
+    fields = {"mode", "state", "heartbeat_at", "tick_seq", "post_gap"}
+    if not isinstance(supervisor, dict) or set(supervisor) != fields:
         raise ProjectionError("status supervisor schema is invalid")
-    if supervisor.get("mode") != "observe" or not isinstance(supervisor.get("post_gap"), bool):
-        raise ProjectionError("status supervisor mode is invalid")
-    if not isinstance(supervisor.get("tick_seq"), int) or isinstance(
-        supervisor.get("tick_seq"), bool
+    heartbeat = supervisor["heartbeat_at"]
+    if (
+        supervisor["mode"] != "observe"
+        or supervisor["state"] not in {"ok", "degraded", "critical"}
+        or not isinstance(supervisor["post_gap"], bool)
+        or not isinstance(heartbeat, (int, float))
+        or isinstance(heartbeat, bool)
+        or heartbeat < 0
+        or not _bounded_int(supervisor["tick_seq"])
     ):
-        raise ProjectionError("status tick sequence is invalid")
-    if not isinstance(value.get("missions"), list) or len(value["missions"]) > 64:
+        raise ProjectionError("status supervisor values are invalid")
+    missions = value.get("missions")
+    incidents = value.get("incidents")
+    if not isinstance(missions, list) or len(missions) > 64:
         raise ProjectionError("status missions are invalid")
-    if not isinstance(value.get("incidents"), list) or len(value["incidents"]) > 256:
+    if not isinstance(incidents, list) or len(incidents) > 256:
         raise ProjectionError("status incidents are invalid")
+    for mission in missions:
+        _validate_mission(mission)
+    for incident in incidents:
+        _validate_incident(incident)
     cost = value.get("cost")
     if not isinstance(cost, dict) or set(cost) != {"classification"}:
         raise ProjectionError("status cost schema is invalid")
@@ -53,10 +166,21 @@ def write_projection(path: str | os.PathLike[str], payload: object) -> None:
     target = Path(path)
     try:
         target.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        parent_info = target.parent.lstat()
+        if target.parent.is_symlink() or not stat.S_ISDIR(parent_info.st_mode):
+            raise ProjectionError("status projection directory is unsafe")
+        if hasattr(os, "getuid") and parent_info.st_uid != os.getuid():
+            raise ProjectionError("status projection directory ownership is unsafe")
+        if stat.S_IMODE(parent_info.st_mode) & 0o022:
+            raise ProjectionError("status projection directory permissions are unsafe")
         if target.exists() or target.is_symlink():
             info = target.lstat()
             if target.is_symlink() or not stat.S_ISREG(info.st_mode):
                 raise ProjectionError("status projection must be a regular file")
+            if hasattr(os, "getuid") and info.st_uid != os.getuid():
+                raise ProjectionError("status projection ownership is unsafe")
+            if stat.S_IMODE(info.st_mode) & 0o077:
+                raise ProjectionError("status projection permissions are unsafe")
         descriptor, temporary = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
         try:
             os.fchmod(descriptor, 0o600)
@@ -88,6 +212,8 @@ def read_projection(path: str | os.PathLike[str]) -> dict[str, Any]:
         info = target.lstat()
         if target.is_symlink() or not stat.S_ISREG(info.st_mode):
             raise ProjectionError("status projection must be a regular file")
+        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+            raise ProjectionError("status projection ownership is unsafe")
         if info.st_size > MAX_PROJECTION_BYTES:
             raise ProjectionError("status projection is too large")
         if stat.S_IMODE(info.st_mode) & 0o077:

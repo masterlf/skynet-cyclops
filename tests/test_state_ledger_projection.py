@@ -98,6 +98,37 @@ def test_pure_deterministic_state_derivation() -> None:
     assert first.workers[0].run_id == "run-1"
 
 
+def test_state_derivation_is_topological_but_preserves_manifest_display_order() -> None:
+    data = manifest_data()
+    data["phases"] = list(reversed(data["phases"]))
+    manifest = parse_manifest(data)
+    bindings = {"build": "task-1", "review": "task-2", "verify": "task-3"}
+    state = derive_mission_state(
+        manifest,
+        bindings,
+        Collection(
+            tasks=tasks(),
+            runs=[
+                {
+                    "id": "run-1",
+                    "task_id": "task-2",
+                    "status": "running",
+                    "heartbeat_age_seconds": 12,
+                    "retry_count": 0,
+                }
+            ],
+            diagnostics=[],
+        ),
+    )
+    assert [phase.key for phase in state.phases] == ["verify", "review", "build"]
+    assert {phase.key: phase.state for phase in state.phases} == {
+        "build": "done",
+        "review": "review",
+        "verify": "pending",
+    }
+    assert state.next_phase == "review"
+
+
 def test_unknown_and_evidence_failure_are_not_green() -> None:
     manifest = parse_manifest(manifest_data())
     collection = Collection(tasks=tasks(), runs=[], diagnostics=[])
@@ -202,6 +233,86 @@ def test_projection_schema_variants_fail_closed(mutate: object) -> None:
         projection.validate_projection(payload)
 
 
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: value["missions"].append({"id": "/private/path"}),
+        lambda value: value["missions"][0]["phases"][0].update(raw_log="secret prose"),
+        lambda value: value["missions"][0]["phases"][0].__setitem__("task_id", "/tm" + "p/leak"),
+        lambda value: value["missions"][0]["phases"][0].__setitem__("retry_count", True),
+        lambda value: value["missions"][0]["workers"][0].__setitem__("assignee", "bad name"),
+        lambda value: value["incidents"][0].__setitem__("age_ticks", 0),
+        lambda value: value["missions"][0].__setitem__("outcome", "healthy"),
+        lambda value: value["missions"][0].__setitem__("manifest_sha256", "z" * 64),
+        lambda value: value["missions"][0].__setitem__("manifest_sha256", "a" * 63),
+        lambda value: value["missions"][0].__setitem__("next_phase", "bad phase"),
+        lambda value: value["missions"][0].__setitem__("phases", "invalid"),
+        lambda value: value["missions"][0].__setitem__("workers", "invalid"),
+        lambda value: value["missions"][0]["phases"][0].__setitem__("state", "healthy"),
+        lambda value: value["missions"][0]["phases"][0].__setitem__(
+            "evidence_present", ["tests", "tests"]
+        ),
+        lambda value: value["missions"][0]["phases"][0].__setitem__(
+            "evidence_present", ["bad evidence"]
+        ),
+        lambda value: value["missions"][0]["workers"][0].update(extra=True),
+        lambda value: value["missions"][0]["workers"][0].__setitem__("heartbeat_age_seconds", -1),
+        lambda value: value["missions"][0]["workers"][0].__setitem__("retry_count", True),
+        lambda value: value["incidents"][0].update(extra=True),
+        lambda value: value["incidents"][0].__setitem__("kind", "bad kind"),
+        lambda value: value["incidents"][0].__setitem__("severity", "info"),
+        lambda value: value["incidents"][0].__setitem__("disposition", "resolved"),
+        lambda value: value["incidents"][0].__setitem__("observed_ticks", True),
+    ],
+)
+def test_projection_deeply_rejects_nested_prose_paths_extra_fields_and_bad_types(
+    mutate: object,
+) -> None:
+    payload = _projection_payload()
+    payload["missions"] = [
+        {
+            "id": "synthetic-release",
+            "manifest_sha256": "a" * 64,
+            "outcome": "running",
+            "next_phase": "build",
+            "phases": [
+                {
+                    "key": "build",
+                    "state": "running",
+                    "task_id": "task-1",
+                    "assignee": "builder",
+                    "evidence_present": ["tests"],
+                    "retry_count": 0,
+                }
+            ],
+            "workers": [
+                {
+                    "task_id": "task-1",
+                    "run_id": "1",
+                    "assignee": "builder",
+                    "status": "running",
+                    "heartbeat_age_seconds": None,
+                    "retry_count": 0,
+                }
+            ],
+        }
+    ]
+    payload["incidents"] = [
+        {
+            "id": "incident-1",
+            "phase_key": "build",
+            "kind": "phase_failed",
+            "severity": "critical",
+            "age_ticks": 1,
+            "observed_ticks": 1,
+            "disposition": "observing",
+        }
+    ]
+    mutate(payload)  # type: ignore[operator]
+    with pytest.raises(ProjectionError):
+        projection.validate_projection(payload)
+
+
 def test_projection_write_crash_removes_temporary_and_preserves_existing_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -235,6 +346,19 @@ def test_projection_rejects_oversized_write_permissions_and_invalid_json(
     os.chmod(target, 0o644)
     with pytest.raises(ProjectionError, match="permissions"):
         read_projection(target)
+
+
+def test_projection_rejects_wrong_owner_on_read_and_existing_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "status.json"
+    write_projection(target, _projection_payload())
+    real_uid = os.getuid()
+    monkeypatch.setattr(os, "getuid", lambda: real_uid + 1)
+    with pytest.raises(ProjectionError, match="ownership"):
+        read_projection(target)
+    with pytest.raises(ProjectionError, match="ownership"):
+        write_projection(target, _projection_payload())
 
 
 def test_ledger_manifest_identity_incident_resolution_and_unsafe_metadata(tmp_path: Path) -> None:
@@ -281,6 +405,24 @@ def test_ledger_rejects_wrong_owner_schema_and_unsafe_directory(
     linked_directory.symlink_to(real_directory, target_is_directory=True)
     with pytest.raises(LedgerError, match="directory is unsafe"):
         Ledger.create(linked_directory / "new.db")
+
+
+def test_bootstrap_apply_lock_is_exclusive_across_connections(tmp_path: Path) -> None:
+    path = tmp_path / "ledger.db"
+    first = Ledger.create(path)
+    second = Ledger.open(path)
+    try:
+        with (
+            first.bootstrap_lock(),
+            pytest.raises(LedgerError, match="already running"),
+            second.bootstrap_lock(),
+        ):
+            pass
+        with second.bootstrap_lock():
+            assert (tmp_path / ".ledger.db.bootstrap.lock").stat().st_mode & 0o777 == 0o600
+    finally:
+        second.close()
+        first.close()
 
 
 @pytest.mark.parametrize(

@@ -24,7 +24,7 @@ Cyclops assumes a trusted single-host operator but treats manifests, Kanban meta
 
 | Threat | Primary controls |
 |---|---|
-| Direct corruption of Kanban state | no direct DB writes; supported CLI/API only |
+| Direct corruption of Kanban state | no direct DB writes; supported CLI/API only; exclusive bootstrap apply lock |
 | Command injection | `shell=False`; fixed argv; strict identifiers |
 | Prompt injection | no LLM in nominal path; prose excluded from status; future proposer receives typed quoted evidence only |
 | Duplicate workers | Cyclops never dispatches/reclaims; Hermes remains sole dispatcher |
@@ -32,7 +32,7 @@ Cyclops assumes a trusted single-host operator but treats manifests, Kanban meta
 | Stale supervisor mutation | observe-only initial release; future CAS-like revalidation and intent log |
 | Human gate bypass | no block-category conversion; unknown/needs-input fail closed |
 | Self-review | distinct reviewer required by manifest validation |
-| Secret/PII leakage | redacted projection; public repository scanner; synthetic fixtures |
+| Secret/PII leakage | shared deeply validated projection contract; private ownership/modes; public repository and history scanner; synthetic fixtures |
 | Environment authority leak | sanitized subprocess environment; delegated/Kanban ownership markers removed |
 | Reboot repair storm | non-persistent timer; first post-gap tick observe-only |
 | Supervisor compromise | minimal authority; systemd hardening; no publisher/deployer path |

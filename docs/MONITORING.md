@@ -11,7 +11,7 @@ The projection contains only bounded fields:
 - schema and projection version;
 - supervisor mode, heartbeat and tick sequence;
 - configured mission ID and manifest hash;
-- phase key, state and evidence-key presence;
+- phase key, state and truthy evidence-key presence from the latest successful terminal run;
 - task/run IDs, assignee, status and retry counters;
 - incident IDs, severity, age in ticks and disposition;
 - cost telemetry classification (always `unknown` in v0.1).

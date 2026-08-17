@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
 import sqlite3
 import stat
-from contextlib import suppress
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
@@ -115,6 +117,40 @@ class Ledger:
     def close(self) -> None:
         self._connection.close()
 
+    @contextmanager
+    def bootstrap_lock(self) -> Iterator[None]:
+        """Hold a private cross-process exclusive lock for graph authoring."""
+        lock_path = self.path.with_name(f".{self.path.name}.bootstrap.lock")
+        _secure_parent(lock_path.parent)
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = -1
+        try:
+            descriptor = os.open(lock_path, flags, 0o600)
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode):
+                raise LedgerError("bootstrap lock must be a regular file")
+            if hasattr(os, "getuid") and info.st_uid != os.getuid():
+                raise LedgerError("bootstrap lock ownership is unsafe")
+            if stat.S_IMODE(info.st_mode) & 0o077:
+                raise LedgerError("bootstrap lock permissions are unsafe")
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise LedgerError("bootstrap apply is already running") from exc
+            yield
+        except LedgerError:
+            raise
+        except OSError as exc:
+            raise LedgerError("bootstrap lock is unavailable") from exc
+        finally:
+            if descriptor >= 0:
+                with suppress(OSError):
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                with suppress(OSError):
+                    os.close(descriptor)
+
     @property
     def schema_version(self) -> int:
         row = self._connection.execute(
@@ -183,17 +219,22 @@ class Ledger:
         )
         self._connection.commit()
 
-    def next_tick(self, now: float) -> tuple[int, float | None]:
+    def tick_state(self) -> tuple[int, float | None]:
         row = self._connection.execute(
             "SELECT tick_seq, last_heartbeat FROM meta WHERE singleton=1"
         ).fetchone()
-        sequence = int(row[0]) + 1
-        previous = None if row[1] is None else float(row[1])
-        self._connection.execute(
-            "UPDATE meta SET tick_seq=?, last_heartbeat=? WHERE singleton=1", (sequence, now)
+        return int(row[0]), None if row[1] is None else float(row[1])
+
+    def commit_tick(self, sequence: int, now: float) -> None:
+        cursor = self._connection.execute(
+            """UPDATE meta SET tick_seq=?, last_heartbeat=?
+               WHERE singleton=1 AND tick_seq=?""",
+            (sequence, now, sequence - 1),
         )
+        if cursor.rowcount != 1:
+            self._connection.rollback()
+            raise LedgerError("tick sequence changed concurrently")
         self._connection.commit()
-        return sequence, previous
 
     def reconcile_incidents(
         self,

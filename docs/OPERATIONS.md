@@ -12,10 +12,11 @@ The repository helper is dry-run by default. With `--apply`, it installs only th
 ~/.config/systemd/user/skynet-cyclops.service
 ~/.config/systemd/user/skynet-cyclops.timer
 ~/.config/skynet-cyclops/config.yaml
+~/.config/skynet-cyclops/mission.yaml
 ~/.local/state/skynet-cyclops/
 ```
 
-Install the Python package separately to provide `~/.local/bin/skynet-cyclops`. The helper never installs the package, enables or starts the timer, or enables the dashboard plugin. System packages or root installation are not required for the user-service path.
+Install the Python package separately to provide `~/.local/bin/skynet-cyclops`. The helper installs a functional synthetic mission path and never overwrites an existing operator config or mission on rerun. It never installs the package, enables or starts the timer, or enables the dashboard plugin. System packages or root installation are not required for the user-service path.
 
 ## Safe rollout
 
@@ -33,7 +34,8 @@ Install the Python package separately to provide `~/.local/bin/skynet-cyclops`. 
 cyclops manifest validate /path/to/mission.yaml
 cyclops bootstrap /path/to/mission.yaml --dry-run
 cyclops bootstrap /path/to/mission.yaml --apply --config /path/to/config.yaml
-cyclops tick --config /path/to/config.yaml
+cyclops tick --config /path/to/config.yaml          # silent on success
+cyclops tick --config /path/to/config.yaml --json   # explicit JSON output
 cyclops status --config /path/to/config.yaml --json
 ```
 

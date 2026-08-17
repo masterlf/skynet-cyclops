@@ -6,6 +6,7 @@ import json
 import os
 import re
 import subprocess  # Used only for validated argv with shell=False.  # nosec B404
+import time
 from collections.abc import Mapping
 from typing import Any
 
@@ -65,6 +66,15 @@ _NORMAL_TASK_KEYS = {
     "max_retries",
 }
 _NORMAL_RUN_KEYS = {"id", "task_id", "status", "heartbeat_age_seconds", "retry_count"}
+_BOOTSTRAP_CONTRACT_KEYS = {
+    "schema_version",
+    "phase_key",
+    "kind",
+    "goal_mode",
+    "max_runtime_seconds",
+    "max_retries",
+    "evidence_required",
+}
 
 
 def sanitize_environment(source: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -92,6 +102,51 @@ def _bounded_integer(value: object, field: str, maximum: int = 10**9) -> int:
     return value
 
 
+def _bootstrap_contract(body: str, marker_end: int) -> dict[str, object] | None:
+    encoded = body[marker_end:]
+    if not encoded or len(encoded.encode("utf-8")) > 4096:
+        return None
+    try:
+        value = json.loads(encoded)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(value, dict) or set(value) != _BOOTSTRAP_CONTRACT_KEYS:
+        return None
+    try:
+        phase_key = _safe_identifier(value["phase_key"], "bootstrap.phase_key")
+        kind = _safe_identifier(value["kind"], "bootstrap.kind")
+        runtime = _bounded_integer(
+            value["max_runtime_seconds"], "bootstrap.max_runtime_seconds", 86400
+        )
+        retries = _bounded_integer(value["max_retries"], "bootstrap.max_retries", 10)
+    except ValidationError:
+        return None
+    goal_mode = value["goal_mode"]
+    evidence = value["evidence_required"]
+    if (
+        value["schema_version"] != 1
+        or not isinstance(goal_mode, bool)
+        or not isinstance(evidence, list)
+        or len(evidence) > 32
+    ):
+        return None
+    try:
+        safe_evidence = [_safe_identifier(item, "bootstrap.evidence") for item in evidence]
+    except ValidationError:
+        return None
+    if safe_evidence != sorted(set(safe_evidence)):
+        return None
+    return {
+        "schema_version": 1,
+        "phase_key": phase_key,
+        "kind": kind,
+        "goal_mode": goal_mode,
+        "max_runtime_seconds": runtime,
+        "max_retries": retries,
+        "evidence_required": safe_evidence,
+    }
+
+
 def _extract_evidence(value: object) -> list[str]:
     if value is None:
         return []
@@ -107,7 +162,7 @@ def _extract_evidence(value: object) -> list[str]:
         return []
     evidence = parsed.get("evidence")
     if isinstance(evidence, dict):
-        candidates = list(evidence)
+        candidates = [key for key, item in evidence.items() if item]
     elif isinstance(evidence, list):
         candidates = evidence
     else:
@@ -127,7 +182,7 @@ def normalize_task_rows(value: object) -> list[dict[str, Any]]:
     for raw in value:
         if not isinstance(raw, dict) or not all(isinstance(key, str) for key in raw):
             raise ValidationError("task row has an invalid shape")
-        if not {"id", "title", "assignee", "status"}.issubset(raw) or set(raw) - _RAW_TASK_KEYS:
+        if not {"id", "title", "assignee", "status"}.issubset(raw):
             raise ValidationError("task row has unexpected or missing fields")
         identifier = _safe_identifier(raw["id"], "task.id")
         if identifier in seen:
@@ -152,6 +207,9 @@ def normalize_task_rows(value: object) -> list[dict[str, Any]]:
         }
         if marker:
             item["bootstrap_key"] = marker.group(1)
+            contract = _bootstrap_contract(body, marker.end())
+            if contract is not None:
+                item["bootstrap_contract"] = contract
         result.append(item)
     return result
 
@@ -164,9 +222,16 @@ def normalize_run_rows(value: object, task_id: str) -> list[dict[str, Any]]:
     for raw in value:
         if not isinstance(raw, dict) or not all(isinstance(key, str) for key in raw):
             raise ValidationError("run row has an invalid shape")
-        if not {"id", "status", "metadata"}.issubset(raw) or set(raw) - _RAW_RUN_KEYS:
+        if not {"id", "status", "metadata"}.issubset(raw):
             raise ValidationError("run row has unexpected or missing fields")
-        identifier = _safe_identifier(raw["id"], "run.id")
+        raw_identifier = raw["id"]
+        identifier = (
+            str(raw_identifier)
+            if isinstance(raw_identifier, int)
+            and not isinstance(raw_identifier, bool)
+            and raw_identifier >= 0
+            else _safe_identifier(raw_identifier, "run.id")
+        )
         if identifier in seen:
             raise ValidationError("runs contains a duplicate id")
         seen.add(identifier)
@@ -186,7 +251,11 @@ def normalize_run_rows(value: object, task_id: str) -> list[dict[str, Any]]:
                 "status": status,
                 "heartbeat_age_seconds": None,
                 "retry_count": 0,
-                "_evidence": _extract_evidence(metadata),
+                "_evidence": _extract_evidence(metadata)
+                if raw.get("status") == "done"
+                and raw.get("outcome") == "completed"
+                and raw.get("ended_at") is not None
+                else [],
             }
         )
     return result
@@ -208,7 +277,36 @@ def validate_json_collection(value: object, *, kind: str) -> list[dict[str, Any]
         if identifier in seen:
             raise ValidationError(f"{kind} contains a duplicate id")
         seen.add(identifier)
-        result.append(dict(raw))
+        normalized = dict(raw)
+        normalized["id"] = identifier
+        normalized["status"] = _safe_identifier(raw["status"], f"{kind}.status")
+        if kind == "tasks":
+            if "title" in raw:
+                normalized["title"] = _safe_string(raw["title"], "tasks.title")
+            for key in ("assignee", "bootstrap_key", "active_run_id"):
+                if key in raw:
+                    normalized[key] = _safe_identifier(raw[key], f"tasks.{key}")
+            evidence = raw.get("evidence", [])
+            if not isinstance(evidence, list) or len(evidence) > 32:
+                raise ValidationError("tasks.evidence has an invalid shape")
+            safe_evidence = [_safe_identifier(item, "tasks.evidence") for item in evidence]
+            if safe_evidence != sorted(set(safe_evidence)):
+                raise ValidationError("tasks.evidence is invalid")
+            normalized["evidence"] = safe_evidence
+            for key in ("retry_count", "max_retries"):
+                if key in raw:
+                    normalized[key] = _bounded_integer(raw[key], f"tasks.{key}", 100)
+        else:
+            normalized["task_id"] = _safe_identifier(raw["task_id"], "runs.task_id")
+            age = raw.get("heartbeat_age_seconds")
+            if age is not None:
+                age = _bounded_integer(age, "runs.heartbeat_age_seconds")
+            normalized["heartbeat_age_seconds"] = age
+            if "retry_count" in raw:
+                normalized["retry_count"] = _bounded_integer(
+                    raw["retry_count"], "runs.retry_count", 100
+                )
+        result.append(normalized)
     return result
 
 
@@ -280,19 +378,25 @@ class HermesAdapter:
         binary: str = "hermes",
         *,
         timeout_seconds: int = 10,
+        collection_timeout_seconds: int = 30,
         max_output_bytes: int = 1024 * 1024,
         environment: Mapping[str, str] | None = None,
     ) -> None:
         if not binary or len(binary) > 4096 or "\x00" in binary:
             raise ValidationError("Hermes binary is invalid")
-        if not 1 <= timeout_seconds <= 45 or not 1024 <= max_output_bytes <= 4 * 1024 * 1024:
+        if (
+            not 1 <= timeout_seconds <= 45
+            or not 1 <= collection_timeout_seconds < 45
+            or not 1024 <= max_output_bytes <= 4 * 1024 * 1024
+        ):
             raise ValidationError("adapter bounds are invalid")
         self.binary = binary
         self.timeout_seconds = timeout_seconds
+        self.collection_timeout_seconds = collection_timeout_seconds
         self.max_output_bytes = max_output_bytes
         self.environment = sanitize_environment(environment)
 
-    def _run(self, arguments: list[str]) -> str:
+    def _run(self, arguments: list[str], *, deadline: float | None = None) -> str:
         if (
             not arguments
             or len(arguments) > 128
@@ -300,6 +404,12 @@ class HermesAdapter:
         ):
             raise AdapterError("Hermes command arguments are invalid")
         argv = [self.binary, *arguments]
+        timeout: float = self.timeout_seconds
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AdapterError("Hermes collection deadline exceeded")
+            timeout = min(timeout, remaining)
         try:
             completed = subprocess.run(  # noqa: S603
                 argv,
@@ -307,7 +417,7 @@ class HermesAdapter:
                 env=self.environment,
                 capture_output=True,
                 text=True,
-                timeout=self.timeout_seconds,
+                timeout=timeout,
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
@@ -326,8 +436,11 @@ class HermesAdapter:
         return self._run(arguments)
 
     def run_json(self, arguments: list[str]) -> object:
+        return self._run_json(arguments)
+
+    def _run_json(self, arguments: list[str], *, deadline: float | None = None) -> object:
         try:
-            return json.loads(self._run(arguments))
+            return json.loads(self._run(arguments, deadline=deadline))
         except json.JSONDecodeError as exc:
             raise AdapterError("Hermes command returned invalid JSON") from exc
 
@@ -342,14 +455,24 @@ class HermesAdapter:
         return normalize_task_rows(value)
 
     def show_task(
-        self, board: str, task_id: str
+        self, board: str, task_id: str, *, _deadline: float | None = None
     ) -> tuple[dict[str, Any], list[dict[str, Any]], list[str]]:
         safe_task = _safe_identifier(task_id, "task_id")
-        value = self.run_json(
-            ["kanban", "--board", _safe_identifier(board, "board"), "show", safe_task, "--json"]
+        arguments = [
+            "kanban",
+            "--board",
+            _safe_identifier(board, "board"),
+            "show",
+            safe_task,
+            "--json",
+        ]
+        value = (
+            self.run_json(arguments)
+            if _deadline is None
+            else self._run_json(arguments, deadline=_deadline)
         )
         expected = {"task", "latest_summary", "parents", "children", "comments", "events", "runs"}
-        if not isinstance(value, dict) or set(value) != expected:
+        if not isinstance(value, dict) or not expected.issubset(value):
             raise ValidationError("task detail has an invalid shape")
         tasks = normalize_task_rows([value["task"]])
         if tasks[0]["id"] != safe_task:
@@ -379,9 +502,20 @@ class HermesAdapter:
         task, _runs, _parents = self.show_task(board, task_id)
         return str(task["status"])
 
-    def diagnostics(self, board: str) -> list[dict[str, str | int]]:
-        value = self.run_json(
-            ["kanban", "--board", _safe_identifier(board, "board"), "diagnostics", "--json"]
+    def diagnostics(
+        self, board: str, *, _deadline: float | None = None
+    ) -> list[dict[str, str | int]]:
+        arguments = [
+            "kanban",
+            "--board",
+            _safe_identifier(board, "board"),
+            "diagnostics",
+            "--json",
+        ]
+        value = (
+            self.run_json(arguments)
+            if _deadline is None
+            else self._run_json(arguments, deadline=_deadline)
         )
         return normalize_diagnostics(value)
 
@@ -390,23 +524,30 @@ class HermesAdapter:
             raise ValidationError("bound task identifiers are invalid")
         tasks: list[dict[str, Any]] = []
         all_runs: list[dict[str, Any]] = []
+        deadline = time.monotonic() + self.collection_timeout_seconds
         for task_id in sorted(task_ids):
-            task, task_runs, _parents = self.show_task(board, task_id)
+            task, task_runs, _parents = self.show_task(board, task_id, _deadline=deadline)
             failed = sum(
                 run["status"] in {"crashed", "timed_out", "spawn_failed", "gave_up", "failed"}
                 for run in task_runs
             )
             task["retry_count"] = failed
             evidence: set[str] = set()
+            if task_runs:
+                evidence.update(task_runs[-1].get("_evidence", []))
             for run in task_runs:
-                evidence.update(run.pop("_evidence", []))
+                run.pop("_evidence", None)
             task["evidence"] = sorted(evidence)
             active = [run for run in task_runs if run["status"] in {"running", "claimed"}]
             if active:
                 task["active_run_id"] = active[-1]["id"]
             tasks.append(task)
             all_runs.extend(task_runs)
-        return {"tasks": tasks, "runs": all_runs, "diagnostics": self.diagnostics(board)}
+        return {
+            "tasks": tasks,
+            "runs": all_runs,
+            "diagnostics": self.diagnostics(board, _deadline=deadline),
+        }
 
     def create_task(
         self,
@@ -415,24 +556,61 @@ class HermesAdapter:
         assignee: str,
         parents: list[str],
         idempotency_key: str,
+        *,
+        phase_key: str,
+        kind: str,
+        goal_mode: bool,
+        max_runtime_seconds: int,
+        max_retries: int,
+        evidence_required: list[str],
     ) -> dict[str, Any]:
         safe_key = _safe_identifier(idempotency_key, "idempotency_key")
+        safe_title = _safe_string(title, "title")
+        if safe_title.startswith("-"):
+            raise ValidationError("title must not begin with a dash")
+        safe_evidence = sorted(
+            {_safe_identifier(item, "evidence_required") for item in evidence_required}
+        )
+        contract: dict[str, object] = {
+            "schema_version": 1,
+            "phase_key": _safe_identifier(phase_key, "phase_key"),
+            "kind": _safe_identifier(kind, "kind"),
+            "goal_mode": goal_mode,
+            "max_runtime_seconds": _bounded_integer(
+                max_runtime_seconds, "max_runtime_seconds", 86400
+            ),
+            "max_retries": _bounded_integer(max_retries, "max_retries", 10),
+            "evidence_required": safe_evidence,
+        }
+        if (
+            not isinstance(goal_mode, bool)
+            or len(evidence_required) > 32
+            or len(safe_evidence) != len(evidence_required)
+        ):
+            raise ValidationError("bootstrap card contract is invalid")
         arguments = [
             "kanban",
             "--board",
             _safe_identifier(board, "board"),
             "create",
-            _safe_string(title, "title"),
+            safe_title,
             "--assignee",
             _safe_identifier(assignee, "assignee"),
             "--body",
-            f"[cyclops-idempotency:{safe_key}]",
+            f"[cyclops-idempotency:{safe_key}]\n"
+            + json.dumps(contract, sort_keys=True, separators=(",", ":"), ensure_ascii=True),
             "--idempotency-key",
             safe_key,
             "--initial-status",
             "blocked",
+            "--max-runtime",
+            str(contract["max_runtime_seconds"]),
+            "--max-retries",
+            str(contract["max_retries"]),
             "--json",
         ]
+        if goal_mode:
+            arguments.append("--goal")
         for parent in parents:
             arguments.extend(("--parent", _safe_identifier(parent, "parent")))
         value = self.run_json(arguments)
@@ -465,3 +643,15 @@ class HermesAdapter:
         )
         if not isinstance(value, dict):
             raise AdapterError("Hermes promote response is invalid")
+
+
+class ReadOnlyCollector:
+    """Narrow facade used by ticks; no Kanban mutation methods are exposed."""
+
+    __slots__ = ("_adapter",)
+
+    def __init__(self, adapter: HermesAdapter) -> None:
+        self._adapter = adapter
+
+    def collect(self, board: str, task_ids: list[str]) -> dict[str, object]:
+        return self._adapter.collect(board, task_ids)

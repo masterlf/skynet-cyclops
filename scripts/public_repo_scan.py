@@ -6,7 +6,11 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shutil
 import stat
+
+# Used only for a fixed read-only Git invocation with shell disabled.
+import subprocess  # nosec B404
 import sys
 from pathlib import Path
 
@@ -30,7 +34,12 @@ _GENERATED_FILES = {".coverage", "coverage.json"}
 
 def _rules() -> list[tuple[str, re.Pattern[str]]]:
     private_key = "PRIVATE" + r"\s+" + "KEY"
-    home_path = r"/(?:ho" + r"me/[^/\s]+|ro" + r"ot)(?:/[^\s`'\"]+)+"
+    home_path = (
+        r"(?:/(?:ho"
+        + r"me|Users)/[^/\s]+|/ro"
+        + r"ot)(?:/[^\s`'\"]+)+"
+        + r"|[A-Za-z]:\\Users\\[^\\\s]+(?:\\[^\s`'\"]+)+"
+    )
     email = r"\b[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
     private_ip = (
         r"\b(?:" + "10" + r"\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
@@ -40,7 +49,11 @@ def _rules() -> list[tuple[str, re.Pattern[str]]]:
     return [
         (
             "private key material",
-            re.compile(r"-----BEGIN\s+(?:RSA\s+|EC\s+|OPENSSH\s+)?" + private_key + r"-----"),
+            re.compile(
+                r"-----BEGIN\s+(?:(?:RSA|EC|DSA|OPENSSH|ENCRYPTED)\s+)?"
+                + private_key
+                + r"-----|-----BEGIN\s+PGP\s+PRIVATE\s+KEY\s+BLOCK-----"
+            ),
         ),
         ("absolute private home path", re.compile(home_path)),
         ("email address", re.compile(email)),
@@ -67,7 +80,7 @@ def _candidate_paths(root: Path) -> list[Path]:
             and not (current_path == root and name in {"build", "dist"})
         )
         for name in sorted(files):
-            if name in _GENERATED_FILES:
+            if name in _GENERATED_FILES or name in _EXCLUDED_DIRS:
                 continue
             result.append(current_path / name)
         for name in sorted(directories):
@@ -110,6 +123,39 @@ def scan(root: Path) -> list[str]:
                         continue
                 findings.append(f"{relative}: detected {label}")
                 break
+    git = shutil.which("git")
+    if git is None:
+        findings.append("git history: git executable is unavailable")
+        return findings
+    try:
+        history = subprocess.run(  # noqa: S603 - fixed Git read-only argv
+            [
+                git,
+                "-C",
+                str(root),
+                "log",
+                "--all",
+                "--format=",
+                "--no-ext-diff",
+                "--no-renames",
+                "-p",
+            ],
+            shell=False,  # nosec B603
+            check=False,
+            capture_output=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        findings.append("git history: could not be safely inspected")
+    else:
+        if history.returncode == 0:
+            if len(history.stdout) > 32 * MAX_FILE_BYTES:
+                findings.append("git history: output exceeds size limit")
+            else:
+                text = history.stdout.decode("utf-8", errors="ignore")
+                for label, pattern in rules:
+                    if pattern.search(text):
+                        findings.append(f"git history: detected {label}")
     return findings
 
 

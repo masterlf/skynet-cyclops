@@ -89,7 +89,8 @@ def run_tick(
             ]
             write_projection(status_path, payload)
             return payload
-        tick_seq, previous = ledger.next_tick(timestamp)
+        committed_sequence, previous = ledger.tick_state()
+        tick_seq = committed_sequence + 1
         post_gap = (
             previous is not None and timestamp - previous > manifest.mission.gap_damper_seconds
         )
@@ -127,5 +128,6 @@ def run_tick(
         )
         payload["missions"] = [mission_state.to_dict(digest)]
         payload["incidents"] = incidents
+        ledger.commit_tick(tick_seq, timestamp)
         write_projection(status_path, payload)
         return payload

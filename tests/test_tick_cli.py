@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +67,44 @@ def test_incident_debounce_and_post_gap_observe_only(tmp_path: Path) -> None:
     assert gap["supervisor"]["mode"] == "observe"
     assert collector.calls == ["default", "default", "default"]
     assert "actions" not in json.dumps(gap)
+
+
+def test_collection_failure_does_not_advance_tick_gap_or_debounce_state(tmp_path: Path) -> None:
+    manifest = parse_manifest(manifest_data())
+    ledger_path = tmp_path / "ledger.db"
+    status_path = tmp_path / "status.json"
+    with Ledger.create(ledger_path) as ledger:
+        ledger.register_mission(manifest.mission.id, canonical_manifest_hash(manifest))
+        for phase, task_id in (("build", "a"), ("review", "b"), ("verify", "c")):
+            ledger.bind(manifest.mission.id, phase, task_id, f"key-{phase}")
+    collector = Collector([])
+    first = run_tick(manifest, ledger_path, status_path, collector, now=1000.0, debounce_ticks=2)
+    assert first["supervisor"]["tick_seq"] == 1
+
+    class FailingCollector:
+        def collect(self, board: str, task_ids: list[str]) -> dict[str, object]:
+            raise AdapterError("synthetic adapter outage")
+
+    with pytest.raises(AdapterError):
+        run_tick(
+            manifest, ledger_path, status_path, FailingCollector(), now=1200.0, debounce_ticks=2
+        )
+    with pytest.raises(AdapterError):
+        run_tick(
+            manifest, ledger_path, status_path, FailingCollector(), now=1800.0, debounce_ticks=2
+        )
+    connection = sqlite3.connect(ledger_path)
+    assert connection.execute(
+        "SELECT tick_seq, last_heartbeat FROM meta WHERE singleton=1"
+    ).fetchone() == (1, 1000.0)
+    connection.close()
+    recovered = run_tick(
+        manifest, ledger_path, status_path, collector, now=2000.0, debounce_ticks=2
+    )
+    assert recovered["supervisor"]["tick_seq"] == 2
+    assert recovered["supervisor"]["post_gap"] is True
+    assert recovered["incidents"][0]["observed_ticks"] == 2
+    assert recovered["incidents"][0]["disposition"] == "active"
 
 
 def test_missing_ledger_projects_fail_closed_without_collection(tmp_path: Path) -> None:
@@ -184,6 +223,21 @@ def test_config_rejects_symlink_oversize_and_malformed_yaml(tmp_path: Path) -> N
         load_config(real)
 
 
+def test_config_rejects_unsafe_owner_and_permissions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = write_manifest(tmp_path / "mission.yaml")
+    path = config_file(tmp_path, manifest)
+    path.chmod(0o620)
+    with pytest.raises(ValidationError, match="permissions"):
+        load_config(path)
+    path.chmod(0o600)
+    owner = path.stat().st_uid
+    monkeypatch.setattr("skynet_cyclops.config.os.getuid", lambda: owner + 1)
+    with pytest.raises(ValidationError, match="ownership"):
+        load_config(path)
+
+
 def test_cli_bootstrap_apply_creates_missing_ledger_and_tick_status_text(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -213,6 +267,8 @@ def test_cli_bootstrap_apply_creates_missing_ledger_and_tick_status_text(
     }
     monkeypatch.setattr(cli, "run_tick", lambda *_args, **_kwargs: tick_payload)
     assert main(["tick", "--config", str(config)]) == ExitCode.OK
+    assert capsys.readouterr().out == ""
+    assert main(["tick", "--config", str(config), "--json"]) == ExitCode.OK
     assert json.loads(capsys.readouterr().out) == tick_payload
 
     from skynet_cyclops.projection import write_projection

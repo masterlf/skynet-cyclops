@@ -10,6 +10,10 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import JSONResponse
+
+from skynet_cyclops.errors import ProjectionError
+from skynet_cyclops.projection import validate_projection
 
 MAX_STATUS_BYTES = 256 * 1024
 _SAFE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -25,47 +29,10 @@ def _safe_string(value: object) -> bool:
 
 
 def _validate_status(value: object) -> dict[str, Any]:
-    if not isinstance(value, dict) or set(value) != _TOP:
-        raise StatusUnavailable("status unavailable")
-    if value.get("schema_version") != 1 or value.get("projection_version") != 1:
-        raise StatusUnavailable("status unavailable")
-    supervisor = value.get("supervisor")
-    if not isinstance(supervisor, dict) or set(supervisor) != {
-        "mode",
-        "state",
-        "heartbeat_at",
-        "tick_seq",
-        "post_gap",
-    }:
-        raise StatusUnavailable("status unavailable")
-    if supervisor.get("mode") != "observe" or not _safe_string(supervisor.get("state")):
-        raise StatusUnavailable("status unavailable")
-    if not isinstance(supervisor.get("post_gap"), bool):
-        raise StatusUnavailable("status unavailable")
-    if isinstance(supervisor.get("tick_seq"), bool) or not isinstance(
-        supervisor.get("tick_seq"), int
-    ):
-        raise StatusUnavailable("status unavailable")
-    if not isinstance(supervisor.get("heartbeat_at"), (int, float)) or isinstance(
-        supervisor.get("heartbeat_at"), bool
-    ):
-        raise StatusUnavailable("status unavailable")
-    missions = value.get("missions")
-    incidents = value.get("incidents")
-    if not isinstance(missions, list) or len(missions) > 64:
-        raise StatusUnavailable("status unavailable")
-    if not isinstance(incidents, list) or len(incidents) > 256:
-        raise StatusUnavailable("status unavailable")
-    for mission in missions:
-        _validate_mission(mission)
-    for incident in incidents:
-        _validate_incident(incident)
-    cost = value.get("cost")
-    if not isinstance(cost, dict) or set(cost) != {"classification"}:
-        raise StatusUnavailable("status unavailable")
-    if cost["classification"] not in {"actual", "estimated", "unknown"}:
-        raise StatusUnavailable("status unavailable")
-    return value
+    try:
+        return validate_projection(value)
+    except ProjectionError as exc:
+        raise StatusUnavailable("status unavailable") from exc
 
 
 def _validate_mission(value: object) -> None:
@@ -173,10 +140,13 @@ def _configured_status_path() -> Path:
 router = APIRouter()
 
 
-@router.get("/status")
-def get_status() -> dict[str, Any]:
+@router.get("/status", response_class=JSONResponse)
+def get_status() -> JSONResponse:
     """Return the strict projection; the mounting Hermes host authenticates the request."""
     try:
-        return read_status(_configured_status_path())
+        return JSONResponse(
+            content=read_status(_configured_status_path()),
+            headers={"Cache-Control": "no-store"},
+        )
     except StatusUnavailable:
         raise HTTPException(status_code=503, detail="status unavailable") from None

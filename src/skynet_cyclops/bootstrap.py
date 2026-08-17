@@ -7,16 +7,28 @@ import time
 from dataclasses import asdict, dataclass
 from typing import Any, Protocol
 
-from .errors import AdapterError, ValidationError
+from .errors import AdapterError
 from .ledger import Ledger
-from .manifest import Manifest, Phase, canonical_manifest_hash
+from .manifest import Manifest, canonical_manifest_hash, topological_phases
 
 
 class BootstrapAdapter(Protocol):
     def preflight_profile(self, name: str) -> None: ...
     def list_tasks(self, board: str) -> list[dict[str, Any]]: ...
     def create_task(
-        self, board: str, title: str, assignee: str, parents: list[str], idempotency_key: str
+        self,
+        board: str,
+        title: str,
+        assignee: str,
+        parents: list[str],
+        idempotency_key: str,
+        *,
+        phase_key: str,
+        kind: str,
+        goal_mode: bool,
+        max_runtime_seconds: int,
+        max_retries: int,
+        evidence_required: list[str],
     ) -> dict[str, Any]: ...
     def link_tasks(self, board: str, parent_id: str, child_id: str) -> None: ...
     def task_parents(self, board: str, task_id: str) -> list[str]: ...
@@ -31,27 +43,28 @@ class BootstrapItem:
     assignee: str
     dependency_phases: tuple[str, ...]
     idempotency_key: str
+    kind: str
+    goal_mode: bool
+    max_runtime_seconds: int
+    max_retries: int
+    evidence_required: tuple[str, ...]
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
         value["dependency_phases"] = list(self.dependency_phases)
+        value["evidence_required"] = list(self.evidence_required)
         return value
 
-
-def _topological_phases(manifest: Manifest) -> list[Phase]:
-    by_key = {phase.key: phase for phase in manifest.phases}
-    pending = {key: set(phase.depends_on) for key, phase in by_key.items()}
-    ordered: list[Phase] = []
-    completed: set[str] = set()
-    while pending:
-        ready = sorted(key for key, dependencies in pending.items() if dependencies <= completed)
-        if not ready:
-            raise ValidationError("phase graph cannot be ordered")
-        for key in ready:
-            ordered.append(by_key[key])
-            completed.add(key)
-            del pending[key]
-    return ordered
+    def contract(self) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "phase_key": self.phase_key,
+            "kind": self.kind,
+            "goal_mode": self.goal_mode,
+            "max_runtime_seconds": self.max_runtime_seconds,
+            "max_retries": self.max_retries,
+            "evidence_required": list(self.evidence_required),
+        }
 
 
 def plan_bootstrap(manifest: Manifest) -> tuple[BootstrapItem, ...]:
@@ -64,28 +77,61 @@ def plan_bootstrap(manifest: Manifest) -> tuple[BootstrapItem, ...]:
             dependency_phases=tuple(sorted(phase.depends_on)),
             idempotency_key="cyclops-"
             + hashlib.sha256(f"{digest}\0{phase.key}".encode()).hexdigest()[:32],
+            kind=phase.kind,
+            goal_mode=phase.goal_mode,
+            max_runtime_seconds=phase.max_runtime_seconds,
+            max_retries=phase.max_retries,
+            evidence_required=tuple(sorted(phase.evidence_required)),
         )
-        for phase in _topological_phases(manifest)
+        for phase in topological_phases(manifest)
     )
 
 
-def _reconcile_created_task(
-    adapter: BootstrapAdapter, board: str, idempotency_key: str
+def _task_matches_item(task: dict[str, Any], item: BootstrapItem) -> bool:
+    return (
+        task.get("bootstrap_key") == item.idempotency_key
+        and task.get("title") == item.title
+        and task.get("assignee") == item.assignee
+        and task.get("status") == "blocked"
+        and task.get("bootstrap_contract") == item.contract()
+    )
+
+
+def _select_candidate(
+    tasks: list[dict[str, Any]], item: BootstrapItem, *, reconciliation: bool
 ) -> str | None:
     matches = [
         task
-        for task in adapter.list_tasks(board)
-        if task.get("bootstrap_key") == idempotency_key and isinstance(task.get("id"), str)
+        for task in tasks
+        if task.get("bootstrap_key") == item.idempotency_key and isinstance(task.get("id"), str)
     ]
     if len(matches) > 1:
-        raise AdapterError("Hermes idempotency reconciliation is ambiguous")
-    return None if not matches else str(matches[0]["id"])
+        context = "reconciliation" if reconciliation else "selection"
+        raise AdapterError(f"Hermes bootstrap card {context} is ambiguous")
+    if not matches:
+        return None
+    if not _task_matches_item(matches[0], item):
+        raise AdapterError("Hermes bootstrap card does not match the planned phase")
+    return str(matches[0]["id"])
+
+
+def _reconcile_created_task(
+    adapter: BootstrapAdapter, board: str, item: BootstrapItem
+) -> str | None:
+    return _select_candidate(adapter.list_tasks(board), item, reconciliation=True)
 
 
 def apply_bootstrap(
     manifest: Manifest, adapter: BootstrapAdapter, ledger: Ledger
 ) -> dict[str, str]:
     """Create a blocked graph, verify all edges, then expose roots to the dispatcher."""
+    with ledger.bootstrap_lock():
+        return _apply_bootstrap_locked(manifest, adapter, ledger)
+
+
+def _apply_bootstrap_locked(
+    manifest: Manifest, adapter: BootstrapAdapter, ledger: Ledger
+) -> dict[str, str]:
     plan = plan_bootstrap(manifest)
     for profile in sorted({item.assignee for item in plan}):
         adapter.preflight_profile(profile)
@@ -94,19 +140,14 @@ def apply_bootstrap(
     bindings = ledger.bindings(manifest.mission.id)
 
     existing = adapter.list_tasks(manifest.mission.board)
-    by_key = {
-        task["bootstrap_key"]: task
-        for task in existing
-        if isinstance(task.get("bootstrap_key"), str) and isinstance(task.get("id"), str)
-    }
 
     # Stage 1: every card is created blocked and without edges. No ready window exists.
     for item in plan:
         if item.phase_key in bindings:
             continue
-        task = by_key.get(item.idempotency_key)
-        if task is not None:
-            task_id = str(task["id"])
+        task_id = _select_candidate(existing, item, reconciliation=False)
+        if task_id is not None:
+            pass
         else:
             ledger.prepare_intent(
                 item.idempotency_key, manifest.mission.id, item.phase_key, time.time()
@@ -118,15 +159,22 @@ def apply_bootstrap(
                     item.assignee,
                     [],
                     item.idempotency_key,
+                    phase_key=item.phase_key,
+                    kind=item.kind,
+                    goal_mode=item.goal_mode,
+                    max_runtime_seconds=item.max_runtime_seconds,
+                    max_retries=item.max_retries,
+                    evidence_required=list(item.evidence_required),
                 )
-                task_id = str(created["id"])
             except AdapterError:
-                reconciled = _reconcile_created_task(
-                    adapter, manifest.mission.board, item.idempotency_key
-                )
+                reconciled = _reconcile_created_task(adapter, manifest.mission.board, item)
                 if reconciled is None:
                     raise
                 task_id = reconciled
+            else:
+                task_id = _reconcile_created_task(adapter, manifest.mission.board, item)
+                if task_id is None or task_id != str(created["id"]):
+                    raise AdapterError("Hermes create response does not match the planned phase")
         ledger.bind(manifest.mission.id, item.phase_key, task_id, item.idempotency_key)
         ledger.complete_intent(item.idempotency_key)
         bindings[item.phase_key] = task_id

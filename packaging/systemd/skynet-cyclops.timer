@@ -6,6 +6,7 @@ Description=Run Skynet-Cyclops every 120 seconds
 OnBootSec=120s
 OnUnitActiveSec=120s
 AccuracySec=5s
+RandomizedDelaySec=15s
 Persistent=false
 Unit=skynet-cyclops.service
 

@@ -8,7 +8,7 @@ import sys
 from collections.abc import Sequence
 from enum import IntEnum
 
-from .adapter import HermesAdapter
+from .adapter import HermesAdapter, ReadOnlyCollector
 from .bootstrap import apply_bootstrap, plan_bootstrap
 from .config import default_config_path, default_ledger_path, load_config
 from .errors import AdapterError, CyclopsError, LedgerError, ProjectionError, ValidationError
@@ -41,6 +41,7 @@ def _parser() -> argparse.ArgumentParser:
     bootstrap.add_argument("--config", default=str(default_config_path()))
     tick = commands.add_parser("tick")
     tick.add_argument("--config", default=str(default_config_path()))
+    tick.add_argument("--json", action="store_true")
     status = commands.add_parser("status")
     status.add_argument("--config", default=str(default_config_path()))
     status.add_argument("--json", action="store_true")
@@ -86,10 +87,11 @@ def _execute(args: argparse.Namespace) -> ExitCode:
             manifest,
             config.ledger_path,
             config.status_path,
-            HermesAdapter(binary=config.hermes_binary),
+            ReadOnlyCollector(HermesAdapter(binary=config.hermes_binary)),
             debounce_ticks=config.incident_debounce_ticks,
         )
-        _json(payload)
+        if args.json:
+            _json(payload)
         return ExitCode.OK
     if args.command == "status":
         payload = read_projection(config.status_path)

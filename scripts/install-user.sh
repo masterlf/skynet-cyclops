@@ -45,6 +45,20 @@ install_file() {
   source=$1
   target=$2
   mode=$3
+  preserve=${4-false}
+  if [ "$preserve" = true ] && { [ -e "$target" ] || [ -L "$target" ]; }; then
+    if [ -L "$target" ] || [ ! -f "$target" ]; then
+      printf '%s\n' "refusing unsafe operator file: $target" >&2
+      exit 1
+    fi
+    owner=$(stat -c '%u' "$target")
+    if [ "$owner" != "$(id -u)" ]; then
+      printf '%s\n' "refusing operator file with different owner: $target" >&2
+      exit 1
+    fi
+    printf '%s\n' "preserved existing operator file: $target"
+    return
+  fi
   check_target "$target"
   if [ "$apply" = false ]; then
     printf '%s\n' "dry-run: install $target"
@@ -67,7 +81,8 @@ install_file() {
 
 install_file "$repo_dir/packaging/systemd/skynet-cyclops.service" "$unit_dir/skynet-cyclops.service" 600
 install_file "$repo_dir/packaging/systemd/skynet-cyclops.timer" "$unit_dir/skynet-cyclops.timer" 600
-install_file "$repo_dir/examples/config.yaml" "$app_config_dir/config.yaml" 600
+install_file "$repo_dir/examples/config.yaml" "$app_config_dir/config.yaml" 600 true
+install_file "$repo_dir/examples/release-observe.yaml" "$app_config_dir/mission.yaml" 600 true
 
 if [ "$apply" = true ]; then
   mkdir -p -- "$state_dir"

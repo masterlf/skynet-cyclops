@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from .errors import ValidationError
-from .manifest import Manifest
+from .manifest import Manifest, topological_phases
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,12 +57,17 @@ class MissionState:
     workers: tuple[WorkerState, ...]
 
     def to_dict(self, manifest_hash: str) -> dict[str, Any]:
+        phases = []
+        for item in self.phases:
+            phase = asdict(item)
+            phase["evidence_present"] = list(item.evidence_present)
+            phases.append(phase)
         return {
             "id": self.id,
             "manifest_sha256": manifest_hash,
             "outcome": self.outcome,
             "next_phase": self.next_phase,
-            "phases": [asdict(item) for item in self.phases],
+            "phases": phases,
             "workers": [asdict(item) for item in self.workers],
         }
 
@@ -79,10 +84,11 @@ def derive_mission_state(
                 duplicate_tasks.add(identifier)
             tasks[identifier] = task_row
     runs = {run.get("id"): run for run in collection.runs if isinstance(run.get("id"), str)}
-    phase_states: list[PhaseState] = []
+    phase_states_by_key: dict[str, PhaseState] = {}
     states: dict[str, str] = {}
     workers: list[WorkerState] = []
-    for phase in manifest.phases:
+    ordered_phases = topological_phases(manifest)
+    for phase in ordered_phases:
         task_id = bindings.get(phase.key)
         task = tasks.get(task_id) if task_id is not None else None
         evidence: tuple[str, ...] = ()
@@ -136,15 +142,13 @@ def derive_mission_state(
                     )
                 )
         states[phase.key] = state
-        phase_states.append(
-            PhaseState(
-                key=phase.key,
-                state=state,
-                task_id=task_id,
-                assignee=phase.assignee,
-                evidence_present=evidence,
-                retry_count=retry_count,
-            )
+        phase_states_by_key[phase.key] = PhaseState(
+            key=phase.key,
+            state=state,
+            task_id=task_id,
+            assignee=phase.assignee,
+            evidence_present=evidence,
+            retry_count=retry_count,
         )
     values = set(states.values())
     if "unknown" in values:
@@ -157,11 +161,12 @@ def derive_mission_state(
         outcome = "done"
     else:
         outcome = "running"
-    next_phase = next((phase.key for phase in phase_states if phase.state != "done"), None)
+    next_phase = next((phase.key for phase in ordered_phases if states[phase.key] != "done"), None)
+    phase_states = tuple(phase_states_by_key[phase.key] for phase in manifest.phases)
     return MissionState(
         id=manifest.mission.id,
         outcome=outcome,
         next_phase=next_phase,
-        phases=tuple(phase_states),
+        phases=phase_states,
         workers=tuple(workers),
     )

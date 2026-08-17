@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,7 @@ def test_valid_manifest_and_deterministic_hash(tmp_path: Path) -> None:
         (lambda d: d["phases"][1].__setitem__("assignee", "builder"), "distinct reviewer"),
         (lambda d: d["phases"][0].__setitem__("max_retries", 99), "max_retries"),
         (lambda d: d["phases"][0].__setitem__("goal_mode", "false"), "boolean"),
+        (lambda d: d["phases"][0].__setitem__("title", "--assignee"), "title"),
         (lambda d: d["phases"][0].__setitem__("evidence_required", ["x", "x"]), "duplicate"),
         (lambda d: d["phases"].__setitem__(slice(None), d["phases"] * 40), "phases"),
     ],
@@ -75,3 +77,17 @@ def test_loader_rejects_oversize_and_yaml_alias_bomb(tmp_path: Path) -> None:
     alias.write_text("a: &a [1]\nb: *a\n", encoding="utf-8")
     with pytest.raises(ValidationError):
         load_manifest(alias)
+
+
+def test_loader_rejects_unsafe_owner_and_permissions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = write_manifest(tmp_path / "mission.yaml")
+    os.chmod(path, 0o620)
+    with pytest.raises(ValidationError, match="permissions"):
+        load_manifest(path)
+    os.chmod(path, 0o600)
+    real_uid = os.getuid()
+    monkeypatch.setattr(os, "getuid", lambda: real_uid + 1)
+    with pytest.raises(ValidationError, match="ownership"):
+        load_manifest(path)

@@ -16,7 +16,9 @@ Long-running agent workflows can fail silently even when individual workers have
 
 - **Kanban is canonical.** The manifest declares intent, not mutable progress.
 - **Zero nominal inference.** Monitoring and no-change checks never call a model.
-- **No second dispatcher.** Cyclops never dispatches, promotes, reclaims, publishes, or deploys.
+- **No second dispatcher.** Runtime ticks never mutate Kanban. Explicit `bootstrap --apply` creates,
+  links, verifies, and promotes only dependency roots; Cyclops never dispatches, reclaims, publishes,
+  or deploys.
 - **Observe before actuation.** Monitoring ships before any repair capability.
 - **Bounded authority.** Optional future manager runs are propose-only and tool-free.
 - **Public-safe by default.** Examples are synthetic and status output excludes prose, logs, paths, secrets, and PII.
@@ -27,7 +29,7 @@ Long-running agent workflows can fail silently even when individual workers have
 cyclops manifest validate examples/release-observe.yaml
 cyclops bootstrap examples/release-observe.yaml --dry-run
 cyclops bootstrap examples/release-observe.yaml --apply --config examples/config.yaml
-cyclops tick --config examples/config.yaml
+cyclops tick --config examples/config.yaml --json
 cyclops status --config examples/config.yaml --json
 ```
 
