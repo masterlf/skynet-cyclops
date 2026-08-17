@@ -22,6 +22,8 @@ def test_ci_uses_only_exact_sha_pinned_github_owned_actions() -> None:
 def test_ci_matrix_and_required_release_gates_are_explicit() -> None:
     workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
     quality = workflow["jobs"]["quality"]
+    checkout = quality["steps"][0]
+    assert checkout["with"] == {"persist-credentials": False, "fetch-depth": 0}
     assert quality["strategy"]["matrix"]["python-version"] == ["3.11", "3.12"]
     commands = "\n".join(step.get("run", "") for step in quality["steps"])
     required = [

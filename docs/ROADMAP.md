@@ -4,7 +4,7 @@
 
 The project ships observation before actuation. Each later capability requires an exact regression suite and independent review; no broad autonomous repair mode is planned.
 
-## v0.1 — Observe-first MVP candidate
+## v0.1 — Observe-first MVP
 
 - manifest parser and graph validator;
 - idempotent bootstrap dry-run and explicit apply;
@@ -16,7 +16,7 @@ The project ships observation before actuation. Each later capability requires a
 - public repository privacy/secret scan;
 - zero-LLM nominal-path tests.
 
-The candidate has no repair, manager wake, alert delivery, token accounting, publishing, or deployment path. Bootstrap forwards phase runtime, retry, and goal declarations to Hermes; Cyclops does not implement a second runtime or retry engine.
+Version 0.1 has no repair, manager wake, alert delivery, token accounting, publishing, or deployment path. Bootstrap forwards phase runtime, retry, and goal declarations to Hermes; Cyclops does not implement a second runtime or retry engine.
 
 ## v0.2 — Bounded deterministic repairs
 

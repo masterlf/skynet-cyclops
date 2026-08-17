@@ -6,7 +6,7 @@
 
 Skynet-Cyclops watches durable Hermes Kanban missions without becoming another dispatcher. Kanban remains authoritative; Cyclops derives health from supported CLI/API output, records bounded incidents, and publishes a read-only status projection. Healthy ticks use **zero LLM calls**.
 
-The v0.1 candidate is pre-1.0 and observe-first. Automatic repairs and manager wakes are not implemented.
+Version 0.1.0 is the initial pre-1.0 observe-first release. Automatic repairs and manager wakes are not implemented.
 
 ## Why
 
@@ -45,7 +45,7 @@ See:
 
 ## Status
 
-The v0.1 candidate implements strict manifest validation, explicit idempotent bootstrap, observe-only ticks, a private SQLite ledger, an atomic redacted projection, and an optional read-only dashboard plugin. Bootstrap is the only Kanban-mutating path and requires `--apply`; `tick` and `status` never mutate Kanban. No production support claim is made.
+Version 0.1.0 implements strict manifest validation, explicit idempotent bootstrap, observe-only ticks, a private SQLite ledger, an atomic redacted projection, and an optional read-only dashboard plugin. Bootstrap is the only Kanban-mutating path and requires `--apply`; `tick` and `status` never mutate Kanban. No production support claim is made.
 
 ## License
 
