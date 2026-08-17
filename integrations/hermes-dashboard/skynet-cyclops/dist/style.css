@@ -1,0 +1,33 @@
+.cyclops-panel {
+  color: var(--text-primary);
+  padding: var(--spacing-4, 1rem);
+}
+
+.cyclops-panel header,
+.cyclops-card {
+  border-bottom: 1px solid var(--border-subtle);
+  margin-bottom: var(--spacing-4, 1rem);
+  padding-bottom: var(--spacing-3, 0.75rem);
+}
+
+.cyclops-card h3,
+.cyclops-card h4,
+.cyclops-panel h2,
+.cyclops-panel h3 {
+  color: var(--text-primary);
+}
+
+.cyclops-list {
+  padding-inline-start: var(--spacing-5, 1.25rem);
+}
+
+.cyclops-muted {
+  color: var(--text-secondary);
+}
+
+.cyclops-alert {
+  border: 1px solid var(--border-warning);
+  color: var(--text-warning);
+  margin-bottom: var(--spacing-3, 0.75rem);
+  padding: var(--spacing-3, 0.75rem);
+}

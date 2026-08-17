@@ -14,7 +14,7 @@ Cyclops assumes a trusted single-host operator but treats manifests, Kanban meta
 
 ## Trust boundaries
 
-1. **Manifest boundary:** root-owned configuration enters the supervisor.
+1. **Manifest boundary:** operator-controlled regular-file configuration enters the supervisor.
 2. **Hermes boundary:** JSON and text returned by the Hermes CLI are untrusted parsed input.
 3. **Worker boundary:** comments, summaries and evidence may contain hostile instructions.
 4. **Dashboard boundary:** browser-visible data must be strictly validated and rendered as text.

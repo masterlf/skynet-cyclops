@@ -9,8 +9,9 @@ Open an issue before large changes. Keep pull requests narrow, test-first, synth
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
+python -m pip install --upgrade 'pip>=26.1.2'
 python -m pip install -e '.[dev]'
-pytest
+pytest --cov=skynet_cyclops --cov-report=term-missing
 ```
 
 Follow `AGENTS.md`. Every pull request must include:

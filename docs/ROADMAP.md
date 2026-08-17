@@ -4,7 +4,7 @@
 
 The project ships observation before actuation. Each later capability requires an exact regression suite and independent review; no broad autonomous repair mode is planned.
 
-## v0.1 — Observe-first MVP
+## v0.1 — Observe-first MVP candidate
 
 - manifest parser and graph validator;
 - idempotent bootstrap dry-run and explicit apply;
@@ -15,6 +15,8 @@ The project ships observation before actuation. Each later capability requires a
 - read-only status CLI and Hermes Dashboard integration;
 - public repository privacy/secret scan;
 - zero-LLM nominal-path tests.
+
+The candidate has no repair, manager wake, alert delivery, token accounting, publishing, or deployment path. Phase runtime and retry bounds are declared for operator context but remain owned and enforced by Hermes in v0.1.
 
 ## v0.2 — Bounded deterministic repairs
 

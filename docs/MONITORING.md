@@ -14,7 +14,7 @@ The projection contains only bounded fields:
 - phase key, state and evidence-key presence;
 - task/run IDs, assignee, status and retry counters;
 - incident IDs, severity, age in ticks and disposition;
-- service state and token telemetry classification.
+- cost telemetry classification (always `unknown` in v0.1).
 
 It excludes task bodies, comments, summaries, logs, prompts, environment values, filesystem paths and credentials.
 
@@ -23,13 +23,12 @@ It excludes task bodies, comments, summaries, logs, prompts, environment values,
 The Hermes Dashboard integration displays:
 
 - supervisor reporting state;
-- gateway and dashboard service health when supplied;
 - mission progress and next expected phase;
-- active worker/run/heartbeat age;
+- active worker/run metadata (heartbeat age remains unknown with the v0.1 Hermes CLI adapter);
 - reviewer ownership;
 - retry and incident counters;
 - final evidence checklist;
-- cost telemetry labeled `actual`, `estimated` or `unknown`.
+- cost telemetry; the v0.1 producer emits `unknown` and performs no token accounting.
 
 The panel is read-only. Operational actions remain in Hermes Kanban or systemd.
 
@@ -44,4 +43,4 @@ The initial release does not send messages. Future alerts must be deterministic 
 
 ## Supervising the supervisor
 
-`status.json` is rewritten each tick. A consumer marks Cyclops unavailable after three missed intervals. For full host failure, use an external no-LLM health check.
+`status.json` is rewritten after each successful tick and on ledger-open failure or manifest-binding mismatch. Adapter/collection failures return a nonzero CLI result and leave the prior projection intact, so consumers must check heartbeat freshness. The bundled panel reports the file unavailable when it cannot read and validate it; an external monitor should enforce any missed-interval policy and detect full host failure.

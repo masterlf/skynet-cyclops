@@ -18,7 +18,7 @@ release manifest ──► bootstrap ──► Hermes Kanban (canonical)
 
 ### Manifest
 
-The manifest is immutable runtime intent: mission ID, phases, dependencies, roles, evidence requirements, tick deadlines and budgets. It does not contain commands or runtime status.
+The manifest is immutable runtime intent: mission ID, phases, dependencies, roles, evidence requirements, tick cadence, gap damper, and declared phase runtime/retry bounds. v0.1 reports workflow state but does not enforce phase runtime or retry policy; Hermes remains the sole retry authority. The manifest does not contain commands or runtime status.
 
 ### Bootstrap
 
@@ -54,10 +54,10 @@ The private ledger stores only supervisor-specific data:
 
 - schema/mode/heartbeat/tick sequence;
 - manifest hash and phase-to-task bindings;
-- crash-consistent action intents;
-- incidents and future wake budgets.
+- bootstrap idempotency intents;
+- debounced incidents.
 
-Deletion or corruption forces observe-only. The ledger is not a backup of Kanban.
+Deletion, corruption, an unsafe file type/owner/mode, or a manifest-hash mismatch produces a critical fail-closed projection and skips collection. The ledger is not a backup of Kanban.
 
 ### Dashboard
 

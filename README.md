@@ -6,7 +6,7 @@
 
 Skynet-Cyclops watches durable Hermes Kanban missions without becoming another dispatcher. Kanban remains authoritative; Cyclops derives health from supported CLI/API output, records bounded incidents, and publishes a read-only status projection. Healthy ticks use **zero LLM calls**.
 
-The project is pre-1.0 and observe-first. Automatic repairs and manager wakes are disabled by default.
+The v0.1 candidate is pre-1.0 and observe-first. Automatic repairs and manager wakes are not implemented.
 
 ## Why
 
@@ -21,13 +21,14 @@ Long-running agent workflows can fail silently even when individual workers have
 - **Bounded authority.** Optional future manager runs are propose-only and tool-free.
 - **Public-safe by default.** Examples are synthetic and status output excludes prose, logs, paths, secrets, and PII.
 
-## Planned operator experience
+## v0.1 operator experience
 
 ```bash
 cyclops manifest validate examples/release-observe.yaml
 cyclops bootstrap examples/release-observe.yaml --dry-run
-cyclops tick --config /etc/skynet-cyclops/config.yaml
-cyclops status --json
+cyclops bootstrap examples/release-observe.yaml --apply --config examples/config.yaml
+cyclops tick --config examples/config.yaml
+cyclops status --config examples/config.yaml --json
 ```
 
 See:
@@ -42,7 +43,7 @@ See:
 
 ## Status
 
-The repository is under active initial development. No production support claim is made until the documented acceptance suite and public release gates pass.
+The v0.1 candidate implements strict manifest validation, explicit idempotent bootstrap, observe-only ticks, a private SQLite ledger, an atomic redacted projection, and an optional read-only dashboard plugin. Bootstrap is the only Kanban-mutating path and requires `--apply`; `tick` and `status` never mutate Kanban. No production support claim is made.
 
 ## License
 
