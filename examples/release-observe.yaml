@@ -1,0 +1,44 @@
+schema_version: 1
+mission:
+  id: example-release
+  display_name: Example Release
+  board: default
+  tick_seconds: 120
+  gap_damper_seconds: 300
+  final_phase: verify
+phases:
+  - key: build
+    kind: implementation
+    title: Build the release candidate
+    assignee: builder
+    depends_on: []
+    goal_mode: false
+    max_runtime_seconds: 3600
+    max_retries: 2
+    evidence_required:
+      - commit
+      - tests
+  - key: review
+    kind: review
+    title: Independently review the candidate
+    assignee: reviewer
+    depends_on:
+      - build
+    goal_mode: false
+    max_runtime_seconds: 1800
+    max_retries: 1
+    evidence_required:
+      - reviewed_commit
+      - review_outcome
+  - key: verify
+    kind: verification
+    title: Verify public release evidence
+    assignee: release
+    depends_on:
+      - review
+    goal_mode: false
+    max_runtime_seconds: 1800
+    max_retries: 1
+    evidence_required:
+      - release_url
+      - checksums

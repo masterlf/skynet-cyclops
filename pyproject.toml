@@ -1,0 +1,73 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "skynet-cyclops"
+version = "0.1.0"
+description = "Deterministic, token-efficient supervision for Hermes Kanban workflows"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Skynet-Cyclops Contributors" }]
+keywords = ["hermes-agent", "kanban", "workflow", "supervision", "reliability"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: System :: Monitoring",
+]
+dependencies = ["PyYAML>=6.0.2,<7"]
+
+[project.optional-dependencies]
+dev = [
+  "bandit>=1.8.6,<2",
+  "build>=1.3,<2",
+  "mypy>=1.18,<2",
+  "pip-audit>=2.9,<3",
+  "pytest>=8.4,<9",
+  "pytest-cov>=6.2,<7",
+  "ruff>=0.13,<1",
+]
+
+[project.scripts]
+skynet-cyclops = "skynet_cyclops.cli:main"
+cyclops = "skynet_cyclops.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/masterlf/skynet-cyclops"
+Repository = "https://github.com/masterlf/skynet-cyclops"
+Issues = "https://github.com/masterlf/skynet-cyclops/issues"
+Security = "https://github.com/masterlf/skynet-cyclops/security/policy"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/skynet_cyclops"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "S", "UP", "B", "SIM", "RUF"]
+ignore = ["S101"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["skynet_cyclops"]
+
+[tool.coverage.run]
+branch = true
+source = ["skynet_cyclops"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
