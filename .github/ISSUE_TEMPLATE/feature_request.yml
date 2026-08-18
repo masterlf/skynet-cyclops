@@ -1,0 +1,34 @@
+name: Feature request
+description: Propose a bounded capability or documentation improvement.
+title: "feat: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What operator problem should be solved?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe inputs, outputs, failure behavior, and deterministic acceptance criteria.
+    validations:
+      required: true
+  - type: textarea
+    id: authority
+    attributes:
+      label: Authority and non-goals
+      description: Explain any Kanban mutation, model call, publishing, deployment, or credential requirement. State explicit non-goals.
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification plan
+      description: Which behavioral, crash, idempotency, privacy, and security tests are needed?
+    validations:
+      required: true

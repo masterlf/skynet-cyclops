@@ -6,17 +6,17 @@ Run Cyclops as a systemd user timer in observe-only mode. Healthy ticks are sile
 
 ## Installation model
 
-The packaged installer will place:
+The repository helper is dry-run by default. With `--apply`, it installs only the user unit and example configuration templates and creates the private state directory:
 
 ```text
-~/.local/bin/skynet-cyclops
 ~/.config/systemd/user/skynet-cyclops.service
 ~/.config/systemd/user/skynet-cyclops.timer
 ~/.config/skynet-cyclops/config.yaml
+~/.config/skynet-cyclops/mission.yaml
 ~/.local/state/skynet-cyclops/
 ```
 
-System packages or root installation are not required for the user-service path.
+Install the Python package separately to provide `~/.local/bin/skynet-cyclops`. The helper installs a functional synthetic mission path and never overwrites an existing operator config or mission on rerun. It never installs the package, enables or starts the timer, or enables the dashboard plugin. System packages or root installation are not required for the user-service path.
 
 ## Safe rollout
 
@@ -33,8 +33,10 @@ System packages or root installation are not required for the user-service path.
 ```bash
 cyclops manifest validate /path/to/mission.yaml
 cyclops bootstrap /path/to/mission.yaml --dry-run
-cyclops tick --config /path/to/config.yaml
-cyclops status --config /path/to/config.yaml
+cyclops bootstrap /path/to/mission.yaml --apply --config /path/to/config.yaml
+cyclops tick --config /path/to/config.yaml          # silent on success
+cyclops tick --config /path/to/config.yaml --json   # explicit JSON output
+cyclops status --config /path/to/config.yaml --json
 ```
 
 ## Health
@@ -60,6 +62,10 @@ Stopping Cyclops does not stop Hermes or alter Kanban. Remove the generated proj
 
 - **Projection stale:** check the timer and service journal.
 - **Manifest rejected:** fix the named schema/graph error; do not bypass validation.
-- **Hermes CLI unavailable:** Cyclops reports collection failure and exits nonzero.
+- **Hermes CLI unavailable:** Cyclops exits with code 3 and leaves the prior projection intact; treat it as stale until a successful tick replaces it.
 - **Ledger corrupt:** preserve the file for diagnosis; reinitialize in observe-only mode.
 - **Host unavailable:** use an external uptime monitor; local components cannot report complete host loss.
+
+## Dashboard plugin
+
+The plugin manifest declares a visible `/skynet-cyclops` tab positioned after Kanban, one read-only API route, and static JS/CSS entry files. Copy and enable it only through the supported Hermes Dashboard plugin workflow. Skynet-Cyclops does not auto-enable the plugin, and the manifest intentionally contains no invented default-enablement field.

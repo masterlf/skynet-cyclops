@@ -1,0 +1,14 @@
+# X-Skynet-Cyclops-Owned: true
+[Unit]
+Description=Run Skynet-Cyclops every 120 seconds
+
+[Timer]
+OnBootSec=120s
+OnUnitActiveSec=120s
+AccuracySec=5s
+RandomizedDelaySec=15s
+Persistent=false
+Unit=skynet-cyclops.service
+
+[Install]
+WantedBy=timers.target

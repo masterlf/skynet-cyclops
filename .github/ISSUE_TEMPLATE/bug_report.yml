@@ -1,0 +1,51 @@
+name: Bug report
+description: Report reproducible incorrect behavior with synthetic evidence.
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use synthetic data only. Do not include credentials, personal data, private paths, or production identifiers.
+  - type: textarea
+    id: summary
+    attributes:
+      label: TL;DR
+      description: What happened, and what should have happened?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Synthetic reproduction
+      description: Provide the smallest safe sequence that reproduces the issue.
+      placeholder: |
+        1. Configure example.invalid data...
+        2. Run cyclops ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Skynet-Cyclops version/commit, Python version, OS, and Hermes version if relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact and authority boundary
+      description: State whether this affects observation, bootstrap mutation, privacy, or availability.
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Public-safety confirmation
+      options:
+        - label: I removed secrets, personal data, private infrastructure, and production identifiers.
+          required: true
+        - label: This is not a vulnerability report; vulnerabilities use private reporting.
+          required: true

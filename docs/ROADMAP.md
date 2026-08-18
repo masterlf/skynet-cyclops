@@ -16,6 +16,8 @@ The project ships observation before actuation. Each later capability requires a
 - public repository privacy/secret scan;
 - zero-LLM nominal-path tests.
 
+Version 0.1 has no repair, manager wake, alert delivery, token accounting, publishing, or deployment path. Bootstrap forwards phase runtime, retry, and goal declarations to Hermes; Cyclops does not implement a second runtime or retry engine.
+
 ## v0.2 — Bounded deterministic repairs
 
 Candidate rules, enabled individually after dry-run evidence:

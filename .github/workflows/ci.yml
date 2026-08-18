@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Upgrade trusted installer
+        run: python -m pip install --upgrade "pip>=26.1.2" "setuptools>=83.0.0"
+      - name: Install project and quality tools
+        run: python -m pip install -e '.[dev]'
+      - name: Ruff lint
+        run: ruff check .
+      - name: Ruff format
+        run: ruff format --check .
+      - name: Mypy
+        run: mypy src integrations/hermes-dashboard/skynet-cyclops/plugin_api.py scripts/public_repo_scan.py
+      - name: Behavioral tests and branch coverage
+        run: pytest --cov=skynet_cyclops --cov-report=term-missing
+      - name: Bandit
+        run: bandit -r src integrations scripts -q
+      - name: Dependency audit
+        run: pip-audit
+      - name: Public repository scan
+        run: python scripts/public_repo_scan.py .
+      - name: Build distributions
+        run: python -m build

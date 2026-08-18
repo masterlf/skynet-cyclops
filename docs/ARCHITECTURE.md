@@ -18,11 +18,11 @@ release manifest ──► bootstrap ──► Hermes Kanban (canonical)
 
 ### Manifest
 
-The manifest is immutable runtime intent: mission ID, phases, dependencies, roles, evidence requirements, tick deadlines and budgets. It does not contain commands or runtime status.
+The manifest is immutable runtime intent: mission ID, phases, dependencies, roles, evidence requirements, tick cadence, gap damper, and phase runtime/retry/goal declarations. Bootstrap forwards those declarations to Hermes card creation; Hermes enforces runtime and retry behavior and remains the sole retry authority. The manifest does not contain commands or runtime status.
 
 ### Bootstrap
 
-Bootstrap validates the complete graph before creating cards. Creation uses deterministic idempotency keys and supported Hermes CLI calls. `--dry-run` is the default posture; `--apply` is explicit.
+Bootstrap validates the complete graph before creating cards. Creation uses deterministic idempotency keys, a bounded machine-readable card contract, and supported Hermes CLI calls. Apply holds a private cross-process exclusive lock, rejects ambiguous or mismatched cards, creates every card blocked, verifies the complete graph, and then promotes roots. `--dry-run` is the default posture; `--apply` is explicit.
 
 ### Kanban
 
@@ -54,10 +54,10 @@ The private ledger stores only supervisor-specific data:
 
 - schema/mode/heartbeat/tick sequence;
 - manifest hash and phase-to-task bindings;
-- crash-consistent action intents;
-- incidents and future wake budgets.
+- bootstrap idempotency intents;
+- debounced incidents.
 
-Deletion or corruption forces observe-only. The ledger is not a backup of Kanban.
+Deletion, corruption, an unsafe file type/owner/mode, or a manifest-hash mismatch produces a critical fail-closed projection and skips collection. The ledger is not a backup of Kanban.
 
 ### Dashboard
 
@@ -73,7 +73,7 @@ A phase is derived from its bound task and dependencies:
 - `review`: reviewer phase active;
 - `blocked`: external or technical gate;
 - `failed`: terminal unsuccessful condition;
-- `done`: completed with required evidence metadata;
+- `done`: completed with required truthy evidence metadata from the latest successful terminal run;
 - `unknown`: malformed, missing or contradictory input.
 
 Unknown fails closed. Mission success requires the final phase and final evidence contract.

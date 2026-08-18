@@ -1,0 +1,14 @@
+{
+  "name": "skynet-cyclops",
+  "label": "Skynet-Cyclops",
+  "description": "Read-only observe-first mission status",
+  "icon": "Eye",
+  "version": "0.1.0",
+  "tab": {
+    "path": "/skynet-cyclops",
+    "position": "after:kanban"
+  },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}

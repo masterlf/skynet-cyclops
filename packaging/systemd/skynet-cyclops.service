@@ -1,0 +1,27 @@
+# X-Skynet-Cyclops-Owned: true
+[Unit]
+Description=Skynet-Cyclops observe-only supervisor tick
+Documentation=https://github.com/masterlf/skynet-cyclops
+After=default.target
+ConditionPathExists=%h/.config/skynet-cyclops/config.yaml
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin
+ExecStart=/usr/bin/env skynet-cyclops tick --config %h/.config/skynet-cyclops/config.yaml
+TimeoutStartSec=45
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/skynet-cyclops
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+SystemCallArchitectures=native
+UMask=0077
