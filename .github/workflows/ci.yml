@@ -34,7 +34,7 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
       - name: Upgrade trusted installer
-        run: python -m pip install --upgrade "pip>=26.1.2"
+        run: python -m pip install --upgrade "pip>=26.1.2" "setuptools>=83.0.0"
       - name: Install project and quality tools
         run: python -m pip install -e '.[dev]'
       - name: Ruff lint

@@ -27,7 +27,7 @@ def test_ci_matrix_and_required_release_gates_are_explicit() -> None:
     assert quality["strategy"]["matrix"]["python-version"] == ["3.11", "3.12"]
     commands = "\n".join(step.get("run", "") for step in quality["steps"])
     required = [
-        'python -m pip install --upgrade "pip>=26.1.2"',
+        'python -m pip install --upgrade "pip>=26.1.2" "setuptools>=83.0.0"',
         "ruff check .",
         "ruff format --check .",
         "mypy src integrations/hermes-dashboard/skynet-cyclops/plugin_api.py "
