@@ -9,13 +9,15 @@ import sys
 import time
 from collections.abc import Sequence
 from enum import IntEnum
+from pathlib import Path
 
 from .adapter import HermesAdapter, ReadOnlyCollector
 from .bootstrap import apply_bootstrap, plan_bootstrap
 from .config import default_config_path, default_ledger_path, load_config
 from .errors import AdapterError, CyclopsError, LedgerError, ProjectionError, ValidationError
 from .ledger import Ledger
-from .manager import build_install_plan, manager_router_gate, notification_courier
+from .manager import manager_router_gate, notification_courier
+from .manager_install import build_cron_install_spec, stage_cron_install
 from .manifest import canonical_manifest_hash, load_manifest
 from .projection import read_projection
 from .tick import run_tick
@@ -57,12 +59,35 @@ def _parser() -> argparse.ArgumentParser:
     install = manager_commands.add_parser("install")
     install.add_argument("--profile", default="default")
     install.add_argument("--home-delivery", required=True)
+    install.add_argument("--operation", choices=("install", "upgrade"), default="install")
+    install.add_argument("--snapshot")
+    install.add_argument("--previous-spec")
+    install.add_argument("--hermes-home")
     install.add_argument("--apply", action="store_true")
     return parser
 
 
 def _json(value: object) -> None:
     print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+
+
+def _read_install_json(path: str | None, *, required: bool) -> object:
+    if path is None:
+        if required:
+            raise ValidationError("manager install requires a tool-visible snapshot")
+        return None
+    candidate = Path(path)
+    try:
+        info = candidate.lstat()
+        if candidate.is_symlink() or not candidate.is_file() or info.st_size > 256 * 1024:
+            raise ValidationError("manager install input is unsafe")
+        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+            raise ValidationError("manager install input ownership is unsafe")
+        return json.loads(candidate.read_text(encoding="utf-8"))
+    except ValidationError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValidationError("manager install input is unavailable") from exc
 
 
 def _bootstrap(args: argparse.Namespace) -> ExitCode:
@@ -95,11 +120,28 @@ def _execute(args: argparse.Namespace) -> ExitCode:
         return _bootstrap(args)
     if args.command == "manager":
         if args.manager_command == "install":
+            snapshot_value = _read_install_json(
+                args.snapshot, required=args.apply or args.operation == "upgrade"
+            )
+            if snapshot_value is None:
+                snapshot_value = []
+            if not isinstance(snapshot_value, list):
+                raise ValidationError("manager install snapshot must be a job list")
+            previous = _read_install_json(args.previous_spec, required=args.operation == "upgrade")
+            if previous is not None and not isinstance(previous, dict):
+                raise ValidationError("manager previous spec must be an object")
+            spec = build_cron_install_spec(
+                profile=args.profile,
+                home_delivery=args.home_delivery,
+                operation=args.operation,
+                visible_jobs=snapshot_value,
+                previous_spec=previous,
+            )
             if args.apply:
-                raise ValidationError(
-                    "manager install apply is disabled in v0.2; review dry-run plan"
-                )
-            _json(build_install_plan(profile=args.profile, home_delivery=args.home_delivery))
+                if not args.hermes_home:
+                    raise ValidationError("manager install apply requires --hermes-home")
+                stage_cron_install(spec, Path(args.hermes_home))
+            _json(spec)
             return ExitCode.OK
         config = load_config(args.config)
         with Ledger.open(config.ledger_path) as ledger:

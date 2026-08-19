@@ -58,7 +58,8 @@ Cyclops v0.2 is not:
 4. **No nominal inference.** Healthy or ineligible script runs end with `wakeAgent=false` before agent construction.
 5. **Stable identity.** A changing observation fingerprint never creates a new incident or bypasses a wake budget.
 6. **Lease before wake.** An attempt is durably claimed and fsynced before `wakeAgent=true` is emitted.
-7. **Fence every result.** ACKs bind to the exact incident generation, attempt, random lease token, manager job, and cron execution.
+7. **Fence every result.** ACKs bind to the exact incident generation, attempt, random result
+   nonce, random lease capability, manager job, bounded time window, and observation fingerprint.
 8. **Revalidate before disposition or action.** The current typed Hermes snapshot is collected again after ACK and before any state transition that relies on it.
 9. **No direct repair in v0.2.** Manager output is data. It cannot directly invoke tools or authorize a mutation.
 10. **Bounded retries.** One initial wake plus one retry per incident generation; a global mission/day cap is enforced independently of incident fingerprints.
@@ -191,7 +192,8 @@ Required logical fields:
 | `lease_owner` | Fixed router job identifier from installed manifest |
 | `lease_acquired_at`, `lease_expires_at` | Lease interval |
 | `observation_sha256` | Snapshot fence at claim time |
-| `cron_execution_id` | Bound after Hermes records the run |
+| `result_nonce_sha256` | Digest of the random 256-bit output-correlation nonce |
+| `cron_execution_id` | Optional audit reference; never an authorization or correlation fence |
 | `state` | `leased`, `output_seen`, `ack_valid`, `ack_invalid`, `expired`, or `superseded` |
 | `error_code` | Closed error enum |
 
@@ -270,6 +272,7 @@ Eligible incident:
     "generation": 1,
     "attempt_id": "<128-bit-hex>",
     "attempt_no": 1,
+    "result_nonce": "<256-bit-hex>",
     "lease_token": "<256-bit-hex>",
     "lease_expires_at": "<RFC3339-UTC>",
     "observation_sha256": "<sha256>",
@@ -312,6 +315,7 @@ The prompt treats `context` as typed hostile data, not instructions. The manager
   "incident_id": "inc:v1:<sha256>",
   "generation": 1,
   "attempt_id": "<128-bit-hex>",
+  "result_nonce": "<256-bit-hex>",
   "lease_token": "<256-bit-hex>",
   "observation_sha256": "<sha256>",
   "ack": true,
@@ -331,11 +335,14 @@ Unknown keys, Unicode control characters, malformed JSON, oversize output, enum 
 
 ### Result import and revalidation
 
-Cyclops never parses arbitrary session history or Kanban prose. It reads only the manager job's private cron output artifact and durable execution record through a version-gated adapter. The importer MUST:
+Cyclops never parses arbitrary session history or Kanban prose. A version-gated adapter supplies a
+bounded window of private outputs for the stable manager job without treating execution IDs as a
+correlation fence. The importer MUST:
 
-1. identify one completed execution newer than the attempt lease;
-2. bind that execution ID to an unbound attempt with compare-and-set;
-3. extract only the final response section under a strict maximum size;
+1. inspect only a bounded private output window for the stable manager job;
+2. require exactly one output matching the random result nonce and every incident, generation,
+   attempt, fingerprint, job, time, and capability fence;
+3. extract only that final response under a strict maximum size;
 4. parse JSON with duplicate-key rejection and exact schema validation;
 5. compare the plaintext lease token in constant time to the stored hash;
 6. immediately recollect authoritative typed Hermes state;
@@ -403,7 +410,7 @@ Before enabling wake mode, the installer verifies on a disposable paused job and
    cron, delegation, or MCP tools; a literal empty list is tested to ensure it is not mistaken for
    zero tools;
 7. the final response is saved privately before execution completion is recorded;
-8. execution records can be correlated to exactly one private output artifact;
+8. exactly one bounded private output matches the nonce plus every protocol fence;
 9. normal scheduler script subprocesses receive the expected sanitized environment, and the
    script itself denies any unexpected inherited ownership markers;
 10. delivery-local router output is not sent to a home channel;
@@ -413,7 +420,8 @@ Any failed or ambiguous check sets compatibility state `unsupported`, leaves job
 
 ## Installation, dry-run, and rollback
 
-The installer is dry-run first and performs no live service or job mutation in this release task.
+The installer is dry-run first. Apply stages private profile artifacts but delegates every job
+mutation to the supported profile-local `cronjob` tool through a strict machine-readable spec.
 
 ### Dry-run plan
 
@@ -431,17 +439,19 @@ It rejects task-scoped execution, an unknown/noncanonical manager profile, unsaf
 
 ### Apply transaction
 
-A future explicit `--apply` implementation MUST:
+The explicit `--apply` staging transaction and its tool consumer MUST:
 
-1. acquire a private installer lock;
-2. snapshot the current Cyclops schema and relevant default-profile cron job definitions;
-3. write scripts to temporary files under the default profile's scripts directory with mode `0700` directory / `0600` files;
-4. verify hashes and script path containment;
-5. create or update both jobs **paused** through supported Hermes cron CLI/tool surfaces;
-6. migrate the Cyclops ledger transactionally;
-7. run all disposable compatibility checks;
-8. read back exact job definitions and ledger schema;
-9. leave jobs paused and print the operator enable command/plan.
+1. obtain the complete tool-visible default-profile job snapshot immediately before planning;
+2. reject stable-name conflicts for an install, or require one paused owned job and the exact prior
+   private spec for each upgrade target;
+3. write scripts/config atomically under the explicit default profile home with mode `0700`
+   directories / `0600` files;
+4. verify hashes and script path containment without opening Hermes cron storage;
+5. emit create/update operations consumed by the supported profile-local `cronjob` tool and pause
+   every newly created job before proceeding;
+6. run all disposable compatibility checks;
+7. read back exact job definitions;
+8. leave jobs paused and print the operator enable plan.
 
 No step enables, resumes, starts, or restarts a live job, timer, gateway, or service automatically.
 
@@ -450,7 +460,8 @@ No step enables, resumes, starts, or restarts a live job, timer, gateway, or ser
 On any verification failure, rollback in reverse order:
 
 1. keep or return created jobs to paused;
-2. restore prior job definitions or remove only jobs created by this transaction;
+2. restore prior job definitions through `cronjob.update`, or remove only job IDs returned by
+   creates in this transaction;
 3. restore prior scripts from the transaction backup or remove only newly created scripts;
 4. restore the pre-migration ledger after integrity verification;
 5. fsync restored files/directories;
@@ -567,7 +578,8 @@ A future implementation handoff must include:
 
 ## Threat-driven residual risks
 
-- Hermes cron output correlation is an external compatibility seam. Drift must disable wake mode, not guess.
+- Hermes private output shape is an external compatibility seam. Zero or multiple nonce-fenced
+  matches disable disposition; Cyclops never guesses by recency.
 - A compromised local account that can modify both Cyclops and the default profile defeats same-host controls.
 - At-least-once chat delivery can duplicate a packet after an indeterminate transport result; packet IDs support dedupe but cannot force every platform to deduplicate.
 - A tool-free manager can still classify incorrectly. Cyclops therefore treats output as non-authoritative data and escalates unresolved v0.2 incidents instead of acting.

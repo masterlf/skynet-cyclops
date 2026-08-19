@@ -39,23 +39,41 @@ cyclops tick --config /path/to/config.yaml --json   # explicit JSON output
 cyclops status --config /path/to/config.yaml --json
 ```
 
-## Manager wake-up preview
+## Manager wake-up installation contract
 
-The v0.2 manager path remains disabled until an operator separately installs paused Hermes jobs,
-runs the compatibility seam checks, and explicitly enables the router. This repository task does
-not create or enable those jobs. Review the deterministic, redacted plan with:
+The v0.2 manager path remains disabled until an operator installs paused Hermes jobs through the
+supported profile-local `cronjob` tool, runs the disposable compatibility checks, and explicitly
+enables the router. Cyclops never writes Hermes cron stores or enables jobs. Review the strict
+machine-readable initial-install spec with:
 
 ```bash
 cyclops manager install --profile default --home-delivery telegram
 ```
 
-The command is dry-run only in this increment. `--apply` fails closed. The plan requires a
-`no_mcp` tool sentinel, `deliver=local`, fresh sessions, paused router/courier jobs, a private
-schema-v1 backup before migration, read-back checks, and hash-fenced rollback. Never substitute
-`enabled_toolsets=[]`: Hermes v0.20.3 resolves that through platform defaults rather than to zero
-tools.
+Dry-run changes no files. Before staging, call `cronjob(action="list")` in the canonical `default`
+profile and save its exact `jobs` array as a private snapshot. Initial install requires both stable
+names to be absent. Then stage only private scripts/config and emit the nonce-bound tool spec:
 
-The scripts installed after a future reviewed apply transaction call only:
+```bash
+cyclops manager install --profile default --home-delivery telegram --apply \
+  --snapshot /private/path/cron-jobs.json --hermes-home /private/default-profile-home
+```
+
+The profile-local agent consumes only the emitted `cyclops-cron-install/v1` operations. Each create
+is immediately paused and verified; any later failure removes only job IDs returned by this
+attempt. Upgrades use `--operation upgrade --previous-spec /private/path/manager-install.json`,
+require exactly one paused full-field tool snapshot per stable name, and restore through
+`cronjob.update` in reverse order. A conflict or ambiguous/missing snapshot fails before mutation.
+
+Run `scripts/verify_hermes_cron_seams.py` in a disposable `default` profile before activation. Its
+`cyclops-hermes-seam-evidence/v1` output behaviorally verifies that configured
+`enabled_toolsets=["no_mcp"]` resolves to zero tools under non-dispatcher cron context and that an
+empty no-agent courier run is silent with zero agent construction. This is partial seam evidence;
+the profile-local installer must still verify stable paused identity, local delivery, and bounded
+exactly-one output matching before activation. Never substitute a literal stored
+`enabled_toolsets=[]` for the manager job.
+
+The staged scripts call only:
 
 ```bash
 cyclops manager router --config /path/to/config.yaml   # final wakeAgent JSON gate

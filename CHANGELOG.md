@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented here. The project follows Semantic Versioning after public releases.
 
-## [Unreleased]
+## [0.2.0] - 2026-08-19
 
 ### Added
 
@@ -12,8 +12,10 @@ All notable changes to this project are documented here. The project follows Sem
 - Strict duplicate-key-rejecting manager ACK protocol, constant-time capability validation,
   typed revalidation, and visible `resolved`/`human_required`/`dead_letter` outcomes.
 - Projection v2 and Dashboard-compatible validation for public-safe manager lifecycle metadata.
-- Dry-run manager installation plan with paused jobs, zero-tool seam checks, and hash-fenced
-  rollback instructions. Live apply and automatic repair remain disabled.
+- Strict machine-readable manager installation/upgrade/rollback spec for the supported
+  profile-local `cronjob` tool, with private profile staging and paused-job verification.
+- Disposable installed-Hermes checks for `no_mcp` zero-tool resolution, non-task scope, and the
+  quiet no-agent courier path.
 
 ### Security
 
@@ -21,6 +23,8 @@ All notable changes to this project are documented here. The project follows Sem
   generation and delayed ACKs cannot close a newer occurrence.
 - Lease and budget commits precede every positive wake gate. Clock rollback, task scope, corrupt
   state, cap exhaustion, and unresolved compatibility all fail closed without inference.
+- Private manager output reconciliation uses a random 256-bit per-attempt nonce and accepts
+  exactly one bounded job/time/incident/generation/attempt/fingerprint/capability match.
 
 ## [0.1.0] - 2026-08-17
 

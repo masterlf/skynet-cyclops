@@ -83,6 +83,7 @@ CREATE TABLE wake_attempts (
     incident_id TEXT NOT NULL,
     generation INTEGER NOT NULL,
     attempt_no INTEGER NOT NULL CHECK (attempt_no IN (1, 2)),
+    result_nonce_sha256 TEXT NOT NULL,
     lease_token_sha256 TEXT NOT NULL,
     lease_owner TEXT NOT NULL,
     lease_acquired_at REAL NOT NULL,
@@ -150,7 +151,8 @@ _MIGRATION_V2 = (
     "DROP TABLE incidents_v1",
     """CREATE TABLE wake_attempts (
         attempt_id TEXT PRIMARY KEY, incident_id TEXT NOT NULL, generation INTEGER NOT NULL,
-        attempt_no INTEGER NOT NULL CHECK (attempt_no IN (1, 2)), lease_token_sha256 TEXT NOT NULL,
+        attempt_no INTEGER NOT NULL CHECK (attempt_no IN (1, 2)), result_nonce_sha256 TEXT NOT NULL,
+        lease_token_sha256 TEXT NOT NULL,
         lease_owner TEXT NOT NULL, lease_acquired_at REAL NOT NULL, lease_expires_at REAL NOT NULL,
         observation_sha256 TEXT NOT NULL, cron_execution_id TEXT UNIQUE,
         state TEXT NOT NULL CHECK (state IN ('leased', 'output_seen', 'ack_valid', 'ack_invalid', 'expired', 'superseded')),
@@ -734,18 +736,21 @@ class Ledger:
                 return {"wakeAgent": False}
             attempt_no = int(row[10]) + 1
             attempt_id = secrets.token_hex(16)
+            result_nonce = secrets.token_hex(32)
             lease_token = secrets.token_hex(32)
             expires = now + int(policy.lease_seconds)
             self._connection.execute(
                 """INSERT INTO wake_attempts(
-                       attempt_id, incident_id, generation, attempt_no, lease_token_sha256,
-                       lease_owner, lease_acquired_at, lease_expires_at, observation_sha256, state
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'leased')""",
+                       attempt_id, incident_id, generation, attempt_no, result_nonce_sha256,
+                       lease_token_sha256, lease_owner, lease_acquired_at, lease_expires_at,
+                       observation_sha256, state
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'leased')""",
                 (
                     attempt_id,
                     row[0],
                     row[1],
                     attempt_no,
+                    hashlib.sha256(result_nonce.encode()).hexdigest(),
                     hashlib.sha256(lease_token.encode()).hexdigest(),
                     router_job_id,
                     now,
@@ -773,6 +778,7 @@ class Ledger:
                     "generation": int(row[1]),
                     "attempt_id": attempt_id,
                     "attempt_no": attempt_no,
+                    "result_nonce": result_nonce,
                     "lease_token": lease_token,
                     "lease_expires_at": expires_text,
                     "observation_sha256": str(row[7]),
@@ -799,7 +805,8 @@ class Ledger:
     def manager_attempt(self, attempt_id: str) -> dict[str, object] | None:
         row = self._connection.execute(
             """SELECT attempt_id, incident_id, generation, attempt_no, lease_token_sha256,
-                      lease_owner, lease_acquired_at, lease_expires_at, observation_sha256,
+                      result_nonce_sha256, lease_owner, lease_acquired_at, lease_expires_at,
+                      observation_sha256,
                       cron_execution_id, state, error_code
                FROM wake_attempts WHERE attempt_id=?""",
             (attempt_id,),
@@ -810,6 +817,7 @@ class Ledger:
             "generation",
             "attempt_no",
             "lease_token_sha256",
+            "result_nonce_sha256",
             "lease_owner",
             "lease_acquired_at",
             "lease_expires_at",

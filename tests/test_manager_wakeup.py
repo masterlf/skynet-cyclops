@@ -15,11 +15,13 @@ from skynet_cyclops.errors import LedgerError, ValidationError
 from skynet_cyclops.ledger import Ledger
 from skynet_cyclops.manager import (
     IncidentObservation,
+    ManagerOutput,
     ManagerPolicy,
     ManagerResult,
     assess_hermes_compatibility,
     build_install_plan,
     import_manager_ack,
+    import_manager_outputs,
     import_manager_result,
     manager_router_gate,
     notification_courier,
@@ -175,6 +177,7 @@ def _ack(context: dict[str, object]) -> str:
             "incident_id": context["incident_id"],
             "generation": context["generation"],
             "attempt_id": context["attempt_id"],
+            "result_nonce": context["result_nonce"],
             "lease_token": context["lease_token"],
             "observation_sha256": context["observation_sha256"],
             "ack": True,
@@ -184,6 +187,61 @@ def _ack(context: dict[str, object]) -> str:
         },
         separators=(",", ":"),
     )
+
+
+def test_private_outputs_require_exactly_one_nonce_fenced_match(tmp_path: Path) -> None:
+    with create_ledger(tmp_path / "ledger.db") as ledger:
+        ledger.observe_manager_incidents([observation()], tick_seq=1, now=100.0)
+        ledger.observe_manager_incidents([observation()], tick_seq=2, now=101.0)
+        context = manager_router_gate(ledger, now=101.0)["context"]
+        assert len(context["result_nonce"]) == 64
+        output = ManagerOutput(
+            manager_job_id="cyclops-manager-router",
+            completed_at=102.0,
+            final_response=_ack(context),
+        )
+        assert (
+            import_manager_outputs(
+                ledger,
+                [output],
+                expected_manager_job_id="cyclops-manager-router",
+                condition_persists=lambda _incident: True,
+                now=103.0,
+            )
+            == "human_required"
+        )
+        attempt = ledger.manager_attempt(str(context["attempt_id"]))
+        assert attempt is not None
+        assert str(attempt["cron_execution_id"]).startswith("nonce-sha256:")
+        assert str(context["result_nonce"]) not in json.dumps(attempt)
+
+
+def test_private_outputs_reject_zero_or_multiple_bounded_matches(tmp_path: Path) -> None:
+    with create_ledger(tmp_path / "ledger.db") as ledger:
+        ledger.observe_manager_incidents([observation()], tick_seq=1, now=100.0)
+        ledger.observe_manager_incidents([observation()], tick_seq=2, now=101.0)
+        context = manager_router_gate(ledger, now=101.0)["context"]
+        output = ManagerOutput(
+            manager_job_id="cyclops-manager-router",
+            completed_at=102.0,
+            final_response=_ack(context),
+        )
+        with pytest.raises(ValidationError, match="exactly one"):
+            import_manager_outputs(
+                ledger,
+                [],
+                expected_manager_job_id="cyclops-manager-router",
+                condition_persists=lambda _incident: True,
+                now=103.0,
+            )
+        with pytest.raises(ValidationError, match="exactly one"):
+            import_manager_outputs(
+                ledger,
+                [output, output],
+                expected_manager_job_id="cyclops-manager-router",
+                condition_persists=lambda _incident: True,
+                now=103.0,
+            )
 
 
 def test_ack_parser_rejects_duplicates_unknown_keys_and_mutation_authority() -> None:
@@ -196,6 +254,7 @@ def test_ack_parser_rejects_duplicates_unknown_keys_and_mutation_authority() -> 
         "incident_id": "inc:v1:" + "a" * 64,
         "generation": 1,
         "attempt_id": "a" * 32,
+        "result_nonce": "d" * 64,
         "lease_token": "b" * 64,
         "observation_sha256": "c" * 64,
         "ack": True,
@@ -213,6 +272,7 @@ def test_manager_protocol_rejects_all_untyped_boundaries() -> None:
         "incident_id": "inc:v1:" + "a" * 64,
         "generation": 1,
         "attempt_id": "a" * 32,
+        "result_nonce": "d" * 64,
         "lease_token": "b" * 64,
         "observation_sha256": "c" * 64,
         "ack": True,
@@ -226,6 +286,7 @@ def test_manager_protocol_rejects_all_untyped_boundaries() -> None:
         ("incident_id", "incident"),
         ("generation", True),
         ("attempt_id", "z" * 32),
+        ("result_nonce", "z" * 64),
         ("lease_token", "z" * 64),
         ("observation_sha256", "z" * 64),
         ("reason_code", "PROSE"),
@@ -395,6 +456,16 @@ def test_wrong_token_and_stale_incident_ack_are_rejected(tmp_path: Path) -> None
         ledger.observe_manager_incidents([observation()], tick_seq=2, now=101.0)
         context = manager_router_gate(ledger, now=101.0)["context"]
         wrong = json.loads(_ack(context))
+        wrong["result_nonce"] = "0" * 64
+        with pytest.raises(ValidationError, match="nonce"):
+            import_manager_ack(
+                ledger,
+                json.dumps(wrong),
+                cron_execution_id="exec-wrong-nonce",
+                condition_persists=lambda _incident: True,
+                now=102.0,
+            )
+        wrong = json.loads(_ack(context))
         wrong["lease_token"] = "0" * 64
         with pytest.raises(ValidationError, match="token"):
             import_manager_ack(
@@ -552,6 +623,7 @@ def test_clock_rollback_duplicate_observation_and_unknown_ack_fail_closed(tmp_pa
             "incident_id": "inc:v1:" + "a" * 64,
             "generation": 1,
             "attempt_id": "a" * 32,
+            "result_nonce": "d" * 64,
             "lease_token": "b" * 64,
             "observation_sha256": "c" * 64,
             "ack": True,

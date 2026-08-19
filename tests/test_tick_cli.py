@@ -189,7 +189,8 @@ def test_cli_status_json(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> 
     assert json.loads(capsys.readouterr().out) == payload
 
 
-def test_cli_manager_install_is_dry_run_and_apply_fails_closed(
+def test_cli_manager_install_dry_run_emits_spec_and_apply_only_stages(
+    tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     arguments = [
@@ -201,11 +202,32 @@ def test_cli_manager_install_is_dry_run_and_apply_fails_closed(
         "telegram",
     ]
     assert main(arguments) == ExitCode.OK
-    plan = json.loads(capsys.readouterr().out)
-    assert plan["mode"] == "dry-run"
-    assert plan["mutations"] == []
-    assert main([*arguments, "--apply"]) == ExitCode.INVALID_INPUT
-    assert "apply is disabled" in capsys.readouterr().err
+    spec = json.loads(capsys.readouterr().out)
+    assert spec["protocol"] == "cyclops-cron-install/v1"
+    assert spec["release"] == "0.2.0"
+    snapshot = tmp_path / "snapshot.json"
+    snapshot.write_text("[]\n", encoding="utf-8")
+    profile = tmp_path / "profile"
+    assert (
+        main(
+            [
+                *arguments,
+                "--apply",
+                "--snapshot",
+                str(snapshot),
+                "--hermes-home",
+                str(profile),
+            ]
+        )
+        == ExitCode.OK
+    )
+    applied = json.loads(capsys.readouterr().out)
+    assert applied["protocol"] == "cyclops-cron-install/v1"
+    assert (profile / "scripts" / "cyclops-manager-router.py").is_file()
+    assert (profile / "cyclops" / "manager-install.json").is_file()
+    assert not (profile / "cron").exists()
+    assert main([*arguments, "--operation", "upgrade"]) == ExitCode.INVALID_INPUT
+    assert "snapshot" in capsys.readouterr().err
 
 
 def test_cli_manager_router_denies_task_scope_and_courier_is_silent(
