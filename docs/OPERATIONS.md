@@ -39,6 +39,33 @@ cyclops tick --config /path/to/config.yaml --json   # explicit JSON output
 cyclops status --config /path/to/config.yaml --json
 ```
 
+## Manager wake-up preview
+
+The v0.2 manager path remains disabled until an operator separately installs paused Hermes jobs,
+runs the compatibility seam checks, and explicitly enables the router. This repository task does
+not create or enable those jobs. Review the deterministic, redacted plan with:
+
+```bash
+cyclops manager install --profile default --home-delivery telegram
+```
+
+The command is dry-run only in this increment. `--apply` fails closed. The plan requires a
+`no_mcp` tool sentinel, `deliver=local`, fresh sessions, paused router/courier jobs, a private
+schema-v1 backup before migration, read-back checks, and hash-fenced rollback. Never substitute
+`enabled_toolsets=[]`: Hermes v0.20.3 resolves that through platform defaults rather than to zero
+tools.
+
+The scripts installed after a future reviewed apply transaction call only:
+
+```bash
+cyclops manager router --config /path/to/config.yaml   # final wakeAgent JSON gate
+cyclops manager courier --config /path/to/config.yaml # empty stdout when no intent exists
+```
+
+Task-, run-, board-, workspace-, or delegated-child-scoped router execution is denied before a
+lease or wake budget is acquired. The manager can return only `NOOP` or `ESCALATE`; it cannot
+complete, unblock, retry, publish, deploy, or edit anything.
+
 ## Health
 
 A healthy supervisor has:
@@ -64,6 +91,10 @@ Stopping Cyclops does not stop Hermes or alter Kanban. Remove the generated proj
 - **Manifest rejected:** fix the named schema/graph error; do not bypass validation.
 - **Hermes CLI unavailable:** Cyclops exits with code 3 and leaves the prior projection intact; treat it as stale until a successful tick replaces it.
 - **Ledger corrupt:** preserve the file for diagnosis; reinitialize in observe-only mode.
+- **Manager compatibility unsupported:** leave both jobs paused. Do not bypass the zero-agent,
+  non-task-scope, zero-tool, private-result, local-delivery, or paused-readback checks.
+- **Manager dead letter:** use the stable decision packet ID to deduplicate delivery, inspect the
+  private ledger locally, and keep Kanban changes manual.
 - **Host unavailable:** use an external uptime monitor; local components cannot report complete host loss.
 
 ## Dashboard plugin

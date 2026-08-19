@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import time
 from collections.abc import Sequence
 from enum import IntEnum
 
@@ -13,6 +15,7 @@ from .bootstrap import apply_bootstrap, plan_bootstrap
 from .config import default_config_path, default_ledger_path, load_config
 from .errors import AdapterError, CyclopsError, LedgerError, ProjectionError, ValidationError
 from .ledger import Ledger
+from .manager import build_install_plan, manager_router_gate, notification_courier
 from .manifest import canonical_manifest_hash, load_manifest
 from .projection import read_projection
 from .tick import run_tick
@@ -45,6 +48,16 @@ def _parser() -> argparse.ArgumentParser:
     status = commands.add_parser("status")
     status.add_argument("--config", default=str(default_config_path()))
     status.add_argument("--json", action="store_true")
+    manager = commands.add_parser("manager")
+    manager_commands = manager.add_subparsers(dest="manager_command", required=True)
+    router = manager_commands.add_parser("router")
+    router.add_argument("--config", default=str(default_config_path()))
+    courier = manager_commands.add_parser("courier")
+    courier.add_argument("--config", default=str(default_config_path()))
+    install = manager_commands.add_parser("install")
+    install.add_argument("--profile", default="default")
+    install.add_argument("--home-delivery", required=True)
+    install.add_argument("--apply", action="store_true")
     return parser
 
 
@@ -80,6 +93,23 @@ def _execute(args: argparse.Namespace) -> ExitCode:
         return ExitCode.OK
     if args.command == "bootstrap":
         return _bootstrap(args)
+    if args.command == "manager":
+        if args.manager_command == "install":
+            if args.apply:
+                raise ValidationError(
+                    "manager install apply is disabled in v0.2; review dry-run plan"
+                )
+            _json(build_install_plan(profile=args.profile, home_delivery=args.home_delivery))
+            return ExitCode.OK
+        config = load_config(args.config)
+        with Ledger.open(config.ledger_path) as ledger:
+            if args.manager_command == "router":
+                _json(manager_router_gate(ledger, now=time.time(), environment=os.environ))
+            else:
+                output = notification_courier(ledger, now=time.time())
+                if output:
+                    print(output)
+        return ExitCode.OK
     config = load_config(args.config)
     if args.command == "tick":
         manifest = load_manifest(config.manifest_path)

@@ -6,7 +6,11 @@
 
 Skynet-Cyclops watches durable Hermes Kanban missions without becoming another dispatcher. Kanban remains authoritative; Cyclops derives health from supported CLI/API output, records bounded incidents, and publishes a read-only status projection. Healthy ticks use **zero LLM calls**.
 
-Version 0.1.0 is the initial pre-1.0 observe-first release. Automatic repairs and manager wakes are not implemented.
+The unreleased v0.2 implementation adds a disabled-by-default, diagnose/propose-only manager
+wake path. It persists stable incident generations, leases at most one fresh `default`-profile
+cron session, validates a fenced JSON ACK, revalidates typed state, and exposes `resolved`,
+`human_required`, or `dead_letter`. Healthy and ineligible router/courier ticks remain model-free.
+No live job is installed or enabled, and no automatic repair authority is granted.
 
 ## Why
 
