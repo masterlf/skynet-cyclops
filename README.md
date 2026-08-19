@@ -37,6 +37,7 @@ See:
 
 - [Architecture](docs/ARCHITECTURE.md)
 - [Threat model](docs/THREAT_MODEL.md)
+- [Durable manager wake-up design](docs/MANAGER_WAKEUP.md)
 - [Operations](docs/OPERATIONS.md)
 - [Monitoring](docs/MONITORING.md)
 - [Privacy](docs/PRIVACY.md)

@@ -48,6 +48,20 @@ A short systemd oneshot executes on a timer. It:
 
 The initial release is observe-only. It has no dispatcher, repair, model or publishing path.
 
+### Successor manager wake-up
+
+The v0.2 design adds an explicitly enabled wake path without changing Kanban authority. A
+profile-owned Hermes cron router runs a deterministic pre-check script. Quiet, transient,
+post-gap, duplicate and budget-exhausted ticks return `wakeAgent=false` before Hermes constructs
+an agent. An eligible incident is durably leased before `wakeAgent=true` starts one fresh
+non-dispatcher-owned `default` cron session; it is never represented as a Kanban inbox task.
+
+The first manager is tool-free and diagnose/propose only. Its exact JSON ACK is treated as
+untrusted data, fenced to the incident generation and lease, and followed by a fresh authoritative
+Kanban revalidation. The result is a visible `resolved`, `human_required` or `dead_letter`
+disposition. A separate no-agent courier emits only bounded `human_required` or manager-failure
+packets to the configured home channel. See [Durable manager wake-up](MANAGER_WAKEUP.md).
+
 ### Ledger
 
 The private ledger stores only supervisor-specific data:
@@ -56,6 +70,11 @@ The private ledger stores only supervisor-specific data:
 - manifest hash and phase-to-task bindings;
 - bootstrap idempotency intents;
 - debounced incidents.
+
+The v0.2 schema extends incidents with stable typed identity, recurrence generations, wake
+attempt leases, ACK fences, bounded wake budgets and notification intents. These remain
+supervisor metadata: task status, run claims, PIDs, heartbeats and worker retry counters stay in
+Kanban. Losing or corrupting the ledger disables wakes rather than resetting their budgets.
 
 Deletion, corruption, an unsafe file type/owner/mode, or a manifest-hash mismatch produces a critical fail-closed projection and skips collection. The ledger is not a backup of Kanban.
 
@@ -81,6 +100,11 @@ Unknown fails closed. Mission success requires the final phase and final evidenc
 ## Authority boundaries
 
 Cyclops may observe all configured mission metadata. In observe-only mode it performs no Kanban mutation and no model call. Future actuation must be introduced rule-by-rule with an immutable command allowlist, exact preconditions, write-ahead intent and independent review.
+
+The v0.2 manager wake is not repair authority. The manager has no tools and its closed proposal
+vocabulary cannot directly mutate Kanban, a repository, delivery, publication or deployment.
+Deterministic repairs remain disabled until each exact rule is independently implemented, tested,
+reviewed and enabled.
 
 ## Upstream compatibility
 
