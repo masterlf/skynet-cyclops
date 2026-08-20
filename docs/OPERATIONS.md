@@ -39,6 +39,56 @@ cyclops tick --config /path/to/config.yaml --json   # explicit JSON output
 cyclops status --config /path/to/config.yaml --json
 ```
 
+## Manager wake-up installation contract
+
+The v0.2 manager path remains disabled until an operator installs paused Hermes jobs through the
+supported profile-local `cronjob` tool, runs the disposable compatibility checks, and explicitly
+enables the router. Cyclops never writes Hermes cron stores or enables jobs. Review the strict
+machine-readable initial-install spec with:
+
+```bash
+cyclops manager install --profile default --home-delivery telegram
+```
+
+Dry-run changes no files. Before staging, call `cronjob(action="list")` in the canonical `default`
+profile and save its exact `jobs` array as a private snapshot. Initial install requires both stable
+names to be absent. Then stage only private scripts/config and emit the nonce-bound tool spec:
+
+```bash
+cyclops manager install --profile default --home-delivery telegram --apply \
+  --snapshot /private/path/cron-jobs.json --hermes-home /private/default-profile-home
+```
+
+The profile-local agent consumes only the emitted `cyclops-cron-install/v1` operations. After each
+create, update, and pause it calls `cronjob(action="list", include_disabled=true)` and compares every
+tool-visible security field with the snapshot-bound expected definition. Each create is immediately
+paused and verified; any mismatch or later failure triggers reverse rollback followed by another
+full-field readback. Upgrades use `--operation upgrade --previous-spec /private/path/manager-install.json`,
+require exactly one paused full-field tool snapshot per stable name, and restore through
+`cronjob.update` in reverse order. A conflict or ambiguous/missing snapshot fails before mutation.
+
+Run the wheel-installed `cyclops-verify-hermes-cron-seams` command before activation (the repository
+wrapper `scripts/verify_hermes_cron_seams.py` is equivalent). The verifier always creates and removes
+its own synthetic temporary `default` profile; it does not accept or mutate a configured profile. Its
+`cyclops-hermes-seam-evidence/v1` output behaviorally verifies that configured
+`enabled_toolsets=["no_mcp"]` resolves to zero tools under non-dispatcher cron context and that an
+empty no-agent courier run is silent with zero agent construction, and a synthetic create/pause/list/
+remove cycle exposes exact full-field cronjob readback. This is partial seam evidence;
+the profile-local installer must still verify stable paused identity, local delivery, and bounded
+exactly-one output matching before activation. Never substitute a literal stored
+`enabled_toolsets=[]` for the manager job.
+
+The staged scripts call only:
+
+```bash
+cyclops manager router --config /path/to/config.yaml   # final wakeAgent JSON gate
+cyclops manager courier --config /path/to/config.yaml # empty stdout when no intent exists
+```
+
+Task-, run-, board-, workspace-, or delegated-child-scoped router execution is denied before a
+lease or wake budget is acquired. The manager can return only `NOOP` or `ESCALATE`; it cannot
+complete, unblock, retry, publish, deploy, or edit anything.
+
 ## Health
 
 A healthy supervisor has:
@@ -64,6 +114,10 @@ Stopping Cyclops does not stop Hermes or alter Kanban. Remove the generated proj
 - **Manifest rejected:** fix the named schema/graph error; do not bypass validation.
 - **Hermes CLI unavailable:** Cyclops exits with code 3 and leaves the prior projection intact; treat it as stale until a successful tick replaces it.
 - **Ledger corrupt:** preserve the file for diagnosis; reinitialize in observe-only mode.
+- **Manager compatibility unsupported:** leave both jobs paused. Do not bypass the zero-agent,
+  non-task-scope, zero-tool, private-result, local-delivery, or paused-readback checks.
+- **Manager dead letter:** use the stable decision packet ID to deduplicate delivery, inspect the
+  private ledger locally, and keep Kanban changes manual.
 - **Host unavailable:** use an external uptime monitor; local components cannot report complete host loss.
 
 ## Dashboard plugin

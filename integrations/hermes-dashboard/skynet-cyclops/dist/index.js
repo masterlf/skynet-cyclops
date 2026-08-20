@@ -80,9 +80,13 @@
       h("h3", {}, "Incidents"),
       h(StatusList, {
         items: data.incidents,
-        empty: "No active incidents",
-        render: (incident) => h("li", { key: incident.id }, incident.severity, " · ",
-          incident.phase_key, " · ", incident.kind, " · ", incident.disposition,
+        empty: "No incidents",
+        render: (incident) => h("li", { key: incident.id + ":" + label(incident.generation) },
+          incident.severity, " · ", incident.phase_key, " · ", incident.kind,
+          " · ", incident.lifecycle || incident.disposition,
+          incident.generation ? " · generation " + label(incident.generation) : "",
+          incident.manager_state ? " · manager " + incident.manager_state : "",
+          incident.notification_state ? " · notification " + incident.notification_state : "",
           " · age ", label(incident.age_ticks), " ticks")
       })
     );

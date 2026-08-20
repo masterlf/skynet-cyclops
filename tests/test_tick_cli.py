@@ -104,7 +104,38 @@ def test_collection_failure_does_not_advance_tick_gap_or_debounce_state(tmp_path
     assert recovered["supervisor"]["tick_seq"] == 2
     assert recovered["supervisor"]["post_gap"] is True
     assert recovered["incidents"][0]["observed_ticks"] == 2
-    assert recovered["incidents"][0]["disposition"] == "active"
+    assert recovered["incidents"][0]["disposition"] == "observing"
+    resumed = run_tick(manifest, ledger_path, status_path, collector, now=2010.0, debounce_ticks=2)
+    assert resumed["supervisor"]["post_gap"] is False
+    assert resumed["incidents"][0]["disposition"] == "active"
+
+
+def test_crash_before_tick_commit_rolls_back_manager_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = parse_manifest(manifest_data())
+    ledger_path = tmp_path / "ledger.db"
+    with Ledger.create(ledger_path) as ledger:
+        ledger.register_mission(manifest.mission.id, canonical_manifest_hash(manifest))
+        for phase, task_id in (("build", "a"), ("review", "b"), ("verify", "c")):
+            ledger.bind(manifest.mission.id, phase, task_id, f"key-{phase}")
+
+    def crash(_ledger: Ledger, _sequence: int, _now: float) -> None:
+        raise LedgerError("synthetic pre-commit crash")
+
+    monkeypatch.setattr(Ledger, "commit_tick", crash)
+    with pytest.raises(LedgerError, match="synthetic"):
+        run_tick(
+            manifest,
+            ledger_path,
+            tmp_path / "status.json",
+            Collector([]),
+            now=1000.0,
+        )
+    monkeypatch.undo()
+    with Ledger.open(ledger_path) as ledger:
+        assert ledger.tick_state() == (0, None)
+        assert ledger.manager_incidents() == []
 
 
 def test_missing_ledger_projects_fail_closed_without_collection(tmp_path: Path) -> None:
@@ -156,6 +187,60 @@ def test_cli_status_json(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> 
     write_projection(status_path, payload)
     assert main(["status", "--config", str(config), "--json"]) == ExitCode.OK
     assert json.loads(capsys.readouterr().out) == payload
+
+
+def test_cli_manager_install_dry_run_emits_spec_and_apply_only_stages(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    arguments = [
+        "manager",
+        "install",
+        "--profile",
+        "default",
+        "--home-delivery",
+        "telegram",
+    ]
+    assert main(arguments) == ExitCode.OK
+    spec = json.loads(capsys.readouterr().out)
+    assert spec["protocol"] == "cyclops-cron-install/v1"
+    assert spec["release"] == "0.2.0"
+    snapshot = tmp_path / "snapshot.json"
+    snapshot.write_text("[]\n", encoding="utf-8")
+    profile = tmp_path / "profile"
+    assert (
+        main(
+            [
+                *arguments,
+                "--apply",
+                "--snapshot",
+                str(snapshot),
+                "--hermes-home",
+                str(profile),
+            ]
+        )
+        == ExitCode.OK
+    )
+    applied = json.loads(capsys.readouterr().out)
+    assert applied["protocol"] == "cyclops-cron-install/v1"
+    assert (profile / "scripts" / "cyclops-manager-router.py").is_file()
+    assert (profile / "cyclops" / "manager-install.json").is_file()
+    assert not (profile / "cron").exists()
+    assert main([*arguments, "--operation", "upgrade"]) == ExitCode.INVALID_INPUT
+    assert "snapshot" in capsys.readouterr().err
+
+
+def test_cli_manager_router_denies_task_scope_and_courier_is_silent(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    manifest_path = write_manifest(tmp_path / "mission.yaml")
+    config = config_file(tmp_path, manifest_path)
+    with Ledger.create(tmp_path / "state" / "ledger.db"):
+        pass
+    assert main(["manager", "router", "--config", str(config)]) == ExitCode.OK
+    assert json.loads(capsys.readouterr().out) == {"wakeAgent": False}
+    assert main(["manager", "courier", "--config", str(config)]) == ExitCode.OK
+    assert capsys.readouterr().out == ""
 
 
 def test_manifest_binding_mismatch_fails_closed_without_collection(tmp_path: Path) -> None:

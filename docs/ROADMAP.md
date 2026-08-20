@@ -18,9 +18,23 @@ The project ships observation before actuation. Each later capability requires a
 
 Version 0.1 has no repair, manager wake, alert delivery, token accounting, publishing, or deployment path. Bootstrap forwards phase runtime, retry, and goal declarations to Hermes; Cyclops does not implement a second runtime or retry engine.
 
-## v0.2 — Bounded deterministic repairs
+## v0.2 — Durable manager wake-up
 
-Candidate rules, enabled individually after dry-run evidence:
+- stable typed incident identity and recurrence generations;
+- persistence threshold, dedupe, post-gap damper and hard wake budgets;
+- private lease/ACK/retry/dead-letter lifecycle;
+- fresh non-task-scoped `default` manager through supported Hermes cron/script primitives;
+- tool-free diagnose/propose manager with typed revalidation;
+- visible `resolved` and `human_required` outcomes;
+- no-agent human decision courier;
+- dry-run-first installer with verified rollback.
+
+No direct repair authority ships in this increment. See
+[Durable manager wake-up](MANAGER_WAKEUP.md).
+
+## v0.3 — Bounded deterministic repairs
+
+Candidate rules, enabled individually after dry-run evidence and independent review:
 
 - idempotent incident comment;
 - assign the manifest-declared reviewer to an unclaimed review card;
@@ -28,13 +42,8 @@ Candidate rules, enabled individually after dry-run evidence:
 
 No dispatch, promote, reclaim, complete, unblock, link/unlink, archive, merge, publish or deploy authority.
 
-## v0.3 — Tool-free manager proposals
-
-- self-contained typed incident bundle;
-- tool-free propose-only manager;
-- closed proposal vocabulary;
-- hard wake budgets and dead-letter;
-- supervisor revalidation and allowlisted execution.
+Manager proposals never expand the repair vocabulary. The supervisor owns exact preconditions,
+revalidation, execution and verification for every separately allowlisted rule.
 
 ## Upstream retirement
 

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "skynet-cyclops"
-version = "0.1.0"
+version = "0.2.0"
 description = "Deterministic, token-efficient supervision for Hermes Kanban workflows"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -39,6 +39,7 @@ dev = [
 [project.scripts]
 skynet-cyclops = "skynet_cyclops.cli:main"
 cyclops = "skynet_cyclops.cli:main"
+cyclops-verify-hermes-cron-seams = "skynet_cyclops.hermes_cron_seams:main"
 
 [project.urls]
 Homepage = "https://github.com/masterlf/skynet-cyclops"
@@ -71,6 +72,7 @@ packages = ["skynet_cyclops"]
 [tool.coverage.run]
 branch = true
 source = ["skynet_cyclops"]
+omit = ["src/skynet_cyclops/hermes_cron_seams.py"] # exercised in installed-Hermes subprocesses
 
 [tool.coverage.report]
 fail_under = 90

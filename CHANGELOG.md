@@ -2,6 +2,30 @@
 
 All notable changes to this project are documented here. The project follows Semantic Versioning after public releases.
 
+## [0.2.0] - 2026-08-19
+
+### Added
+
+- Durable schema-v2 incident generations, wake leases, daily budgets, bounded retry/dead-letter,
+  notification intents, and crash-safe v1 migration with a retained private backup.
+- Deterministic manager router and no-agent courier CLI boundaries with task-scope denial.
+- Strict duplicate-key-rejecting manager ACK protocol, constant-time capability validation,
+  typed revalidation, and visible `resolved`/`human_required`/`dead_letter` outcomes.
+- Projection v2 and Dashboard-compatible validation for public-safe manager lifecycle metadata.
+- Strict machine-readable manager installation/upgrade/rollback spec for the supported
+  profile-local `cronjob` tool, with private profile staging and paused-job verification.
+- Disposable installed-Hermes checks for `no_mcp` zero-tool resolution, non-task scope, and the
+  quiet no-agent courier path.
+
+### Security
+
+- Stable incident IDs exclude mutable severity, state, and fingerprints; recurrence is fenced by
+  generation and delayed ACKs cannot close a newer occurrence.
+- Lease and budget commits precede every positive wake gate. Clock rollback, task scope, corrupt
+  state, cap exhaustion, and unresolved compatibility all fail closed without inference.
+- Private manager output reconciliation uses a random 256-bit per-attempt nonce and accepts
+  exactly one bounded job/time/incident/generation/attempt/fingerprint/capability match.
+
 ## [0.1.0] - 2026-08-17
 
 ### Added

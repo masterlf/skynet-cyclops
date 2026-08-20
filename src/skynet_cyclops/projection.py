@@ -118,13 +118,79 @@ def _validate_incident(value: object) -> None:
         raise ProjectionError("status incident counters are invalid")
 
 
+def _validate_incident_v2(value: object) -> None:
+    fields = {
+        "id",
+        "generation",
+        "mission_id",
+        "phase_key",
+        "kind",
+        "subject_task_id",
+        "subject_run_id",
+        "severity",
+        "age_ticks",
+        "observed_ticks",
+        "disposition",
+        "lifecycle",
+        "terminal_reason",
+        "reason_code",
+        "human_question_code",
+        "attempt_count",
+        "next_attempt_at",
+        "manager_state",
+        "notification_state",
+        "acknowledged_at",
+        "terminal_at",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ProjectionError("status incident v2 schema is invalid")
+    if not all(_safe_identifier(value[key]) for key in ("id", "mission_id", "phase_key", "kind")):
+        raise ProjectionError("status incident v2 identity is invalid")
+    for key in (
+        "subject_task_id",
+        "subject_run_id",
+        "terminal_reason",
+        "reason_code",
+        "human_question_code",
+    ):
+        if value[key] is not None and not _safe_identifier(value[key]):
+            raise ProjectionError("status incident v2 optional identity is invalid")
+    if (
+        value["severity"] not in {"warning", "critical"}
+        or value["disposition"] not in {"observing", "active", "resolved"}
+        or value["lifecycle"]
+        not in {"detected", "wake_sent", "claimed", "resolved", "human_required", "dead_letter"}
+        or value["manager_state"] not in {"idle", "leased", "ack_valid", "retry_wait", "failed"}
+        or value["notification_state"]
+        not in {"none", "pending", "leased", "sent", "failed", "acknowledged"}
+    ):
+        raise ProjectionError("status incident v2 state is invalid")
+    for key, minimum, maximum in (
+        ("generation", 1, 10**9),
+        ("age_ticks", 1, 10**9),
+        ("observed_ticks", 1, 10**9),
+        ("attempt_count", 0, 2),
+    ):
+        if not _bounded_int(value[key], minimum, maximum):
+            raise ProjectionError("status incident v2 counter is invalid")
+    for key in ("next_attempt_at", "acknowledged_at", "terminal_at"):
+        item = value[key]
+        if item is not None and (
+            not isinstance(item, (int, float)) or isinstance(item, bool) or item < 0
+        ):
+            raise ProjectionError("status incident v2 timestamp is invalid")
+
+
 def validate_projection(value: object) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != _TOP_LEVEL:
         raise ProjectionError("status projection schema is invalid")
-    if value.get("schema_version") != 1 or value.get("projection_version") != 1:
+    version = value.get("schema_version")
+    if version not in {1, 2} or value.get("projection_version") != version:
         raise ProjectionError("status projection version is unsupported")
     supervisor = value.get("supervisor")
     fields = {"mode", "state", "heartbeat_at", "tick_seq", "post_gap"}
+    if version == 2:
+        fields |= {"compatibility_state", "wake_enabled"}
     if not isinstance(supervisor, dict) or set(supervisor) != fields:
         raise ProjectionError("status supervisor schema is invalid")
     heartbeat = supervisor["heartbeat_at"]
@@ -138,6 +204,11 @@ def validate_projection(value: object) -> dict[str, Any]:
         or not _bounded_int(supervisor["tick_seq"])
     ):
         raise ProjectionError("status supervisor values are invalid")
+    if version == 2 and (
+        supervisor["compatibility_state"] not in {"supported", "unsupported", "unchecked"}
+        or not isinstance(supervisor["wake_enabled"], bool)
+    ):
+        raise ProjectionError("status manager compatibility is invalid")
     missions = value.get("missions")
     incidents = value.get("incidents")
     if not isinstance(missions, list) or len(missions) > 64:
@@ -147,7 +218,7 @@ def validate_projection(value: object) -> dict[str, Any]:
     for mission in missions:
         _validate_mission(mission)
     for incident in incidents:
-        _validate_incident(incident)
+        _validate_incident_v2(incident) if version == 2 else _validate_incident(incident)
     cost = value.get("cost")
     if not isinstance(cost, dict) or set(cost) != {"classification"}:
         raise ProjectionError("status cost schema is invalid")
