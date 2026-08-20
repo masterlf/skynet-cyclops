@@ -197,7 +197,7 @@ def test_initial_spec_is_closed_machine_readable_and_rolls_back_new_ids() -> Non
         "rollback",
     }
     assert spec["protocol"] == "cyclops-cron-install/v1"
-    assert spec["release"] == "0.2.0"
+    assert spec["release"] == "0.2.1"
     assert spec["attempt_nonce"] == NONCE
     assert [item["action"] for item in spec["operations"]] == ["create", "create"]
     assert spec["operations"][0]["arguments"]["enabled_toolsets"] == ["no_mcp"]

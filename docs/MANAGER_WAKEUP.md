@@ -418,6 +418,14 @@ Before enabling wake mode, the installer verifies on a disposable paused job and
 
 Any failed or ambiguous check sets compatibility state `unsupported`, leaves jobs paused, and preserves observe-only operation. Runtime version drift invalidates cached seam approval until checks pass again.
 
+v0.2.1 persists that approval only as an owner-private atomic activation attestation. The router and
+projection call the same side-effect-free validator against fresh supported full-definition evidence.
+Absent evidence maps to `unchecked,false`; a current disabled record maps to `supported,false`; a
+current enabled record maps to `supported,true`; every malformed, stale, unverifiable, or drifted
+case maps to `unsupported,false`. Private paths, identifiers, hashes, versions and reason codes never
+enter projection. The validator runs after task-scope denial but before lifecycle reconciliation,
+lease acquisition, budget consumption, or any model construction.
+
 ## Installation, dry-run, and rollback
 
 The installer is dry-run first. Apply stages private profile artifacts but delegates every job

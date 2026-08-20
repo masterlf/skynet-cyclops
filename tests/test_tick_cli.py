@@ -10,8 +10,9 @@ import yaml
 from conftest import manifest_data, write_manifest
 
 from skynet_cyclops import cli
+from skynet_cyclops.activation import ActivationVerdict
 from skynet_cyclops.cli import ExitCode, main
-from skynet_cyclops.config import load_config
+from skynet_cyclops.config import default_ledger_path, default_status_path, load_config
 from skynet_cyclops.errors import (
     AdapterError,
     CyclopsError,
@@ -33,6 +34,14 @@ class Collector:
         self.calls.append(board)
         assert sorted(task_ids) == ["a", "b", "c"]
         return {"tasks": self.tasks, "runs": [], "diagnostics": []}
+
+
+def test_default_state_paths_follow_xdg_state_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    assert default_ledger_path() == tmp_path / "skynet-cyclops" / "ledger.db"
+    assert default_status_path() == tmp_path / "skynet-cyclops" / "status.json"
 
 
 def config_file(tmp_path: Path, manifest: Path) -> Path:
@@ -149,6 +158,38 @@ def test_missing_ledger_projects_fail_closed_without_collection(tmp_path: Path) 
     assert collector.calls == []
 
 
+@pytest.mark.parametrize(
+    ("verdict", "expected"),
+    [
+        (ActivationVerdict("absent", "unchecked", False), ("unchecked", False)),
+        (ActivationVerdict("disabled", "supported", False), ("supported", False)),
+        (ActivationVerdict("supported", "supported", True), ("supported", True)),
+        (ActivationVerdict("spec_drift", "unsupported", False), ("unsupported", False)),
+    ],
+)
+def test_tick_projects_shared_activation_verdict(
+    tmp_path: Path, verdict: ActivationVerdict, expected: tuple[str, bool]
+) -> None:
+    manifest = parse_manifest(manifest_data())
+    ledger_path = tmp_path / "ledger.db"
+    with Ledger.create(ledger_path) as ledger:
+        ledger.register_mission(manifest.mission.id, canonical_manifest_hash(manifest))
+        for phase, task_id in (("build", "a"), ("review", "b"), ("verify", "c")):
+            ledger.bind(manifest.mission.id, phase, task_id, f"key-{phase}")
+    payload = run_tick(
+        manifest,
+        ledger_path,
+        tmp_path / "status.json",
+        Collector([]),
+        now=1.0,
+        activation_check=lambda: verdict,
+    )
+    supervisor = payload["supervisor"]
+    assert (supervisor["compatibility_state"], supervisor["wake_enabled"]) == expected
+    if verdict.reason not in {"absent", "disabled", "supported"}:
+        assert verdict.reason not in json.dumps(payload)
+
+
 def test_cli_validate_bootstrap_dry_default_status_and_exit_codes(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -204,7 +245,7 @@ def test_cli_manager_install_dry_run_emits_spec_and_apply_only_stages(
     assert main(arguments) == ExitCode.OK
     spec = json.loads(capsys.readouterr().out)
     assert spec["protocol"] == "cyclops-cron-install/v1"
-    assert spec["release"] == "0.2.0"
+    assert spec["release"] == "0.2.1"
     snapshot = tmp_path / "snapshot.json"
     snapshot.write_text("[]\n", encoding="utf-8")
     profile = tmp_path / "profile"
@@ -241,6 +282,57 @@ def test_cli_manager_router_denies_task_scope_and_courier_is_silent(
     assert json.loads(capsys.readouterr().out) == {"wakeAgent": False}
     assert main(["manager", "courier", "--config", str(config)]) == ExitCode.OK
     assert capsys.readouterr().out == ""
+
+
+def test_cli_manager_activate_and_deactivate_are_dry_run_first(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_path = write_manifest(tmp_path / "mission.yaml")
+    config = config_file(tmp_path, manifest_path)
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    evidence = tmp_path / "evidence.json"
+    evidence.write_text("{}", encoding="utf-8")
+    home = tmp_path / "profile"
+    home.mkdir(mode=0o700)
+    calls: list[tuple[str, bool]] = []
+
+    monkeypatch.setattr(cli, "load_activation_inputs", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        cli,
+        "activate_manager",
+        lambda _inputs, *, now, apply, environment, refresh: (
+            calls.append((now, apply))
+            or {"mode": "applied" if apply else "dry-run", "wake_enabled": apply}
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "deactivate_manager",
+        lambda _path, *, now, apply, environment: (
+            calls.append((now, apply))
+            or {"mode": "applied" if apply else "dry-run", "wake_enabled": False}
+        ),
+    )
+    activation_args = [
+        "manager",
+        "activate",
+        "--config",
+        str(config),
+        "--evidence",
+        str(evidence),
+        "--hermes-home",
+        str(home),
+    ]
+    assert main(activation_args) == ExitCode.OK
+    assert json.loads(capsys.readouterr().out)["mode"] == "dry-run"
+    assert main([*activation_args, "--apply"]) == ExitCode.OK
+    assert json.loads(capsys.readouterr().out)["mode"] == "applied"
+    assert main(["manager", "deactivate", "--config", str(config)]) == ExitCode.OK
+    assert json.loads(capsys.readouterr().out)["mode"] == "dry-run"
+    assert [apply for _now, apply in calls] == [False, True, False]
 
 
 def test_manifest_binding_mismatch_fails_closed_without_collection(tmp_path: Path) -> None:

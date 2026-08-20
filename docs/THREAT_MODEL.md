@@ -27,6 +27,9 @@ Cyclops assumes a trusted single-host operator but treats manifests, Kanban meta
    schema, lease, generation, execution and current-state revalidation succeeds.
 8. **Human-delivery boundary:** only bounded typed decision packets may cross from private state
    to a configured home channel.
+9. **Activation boundary:** a private attestation is authorization evidence only while a fresh,
+   supported full-definition readback still matches every bound release/profile/job/spec/script/seam
+   field; status projection is never an authorization source.
 
 ## Threats and controls
 
@@ -54,6 +57,7 @@ Cyclops assumes a trusted single-host operator but treats manifests, Kanban meta
 | Silent manager or compatibility failure | one retry then visible `dead_letter`; version-gated Hermes seam; unsupported behavior disables wake mode |
 | Duplicate/missing human notification | durable notification outbox and stable packet ID; verified delivery suppresses repeats; indeterminate delivery retries once; no exactly-once claim |
 | Installer confused deputy / rollback clobber | dry-run default; canonical profile discovery; paused jobs; hash ownership; exact read-back; reverse rollback that refuses changed operator objects |
+| Stale or forged manager activation | owner-private atomic attestation; five-minute current evidence; exact full-prompt/job/spec/script/Hermes/seam binding; shared validator before lease/budget; preview-only evidence unsupported |
 
 ## Explicit non-goals
 

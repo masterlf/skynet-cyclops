@@ -39,7 +39,7 @@ cyclops tick --config /path/to/config.yaml --json   # explicit JSON output
 cyclops status --config /path/to/config.yaml --json
 ```
 
-## Manager wake-up installation contract
+## Manager wake-up installation and activation contract
 
 The v0.2 manager path remains disabled until an operator installs paused Hermes jobs through the
 supported profile-local `cronjob` tool, runs the disposable compatibility checks, and explicitly
@@ -85,6 +85,39 @@ cyclops manager router --config /path/to/config.yaml   # final wakeAgent JSON ga
 cyclops manager courier --config /path/to/config.yaml # empty stdout when no intent exists
 ```
 
+### Activation
+
+Activation consumes an owner-private (`0600`), duplicate-key-free
+`cyclops-manager-current-evidence/v1` envelope produced from a supported, exact full-definition
+Hermes API/tool adapter. It must name `source=supported-full-definition-api`, the canonical
+`default` profile, collection time, current Hermes version, both exact paused job definitions with
+full `prompt_sha256`, and a complete `cyclops-hermes-seam-evidence/v1` report. The envelope expires
+after five minutes. A `cronjob list` prompt preview, the desired install spec, private cron storage,
+or session history is never sufficient evidence.
+
+```bash
+# Both forms perform identical validation; the first writes nothing.
+cyclops manager activate --config /path/to/config.yaml \
+  --evidence /private/current-evidence.json \
+  --hermes-home /private/.hermes/profiles/default
+cyclops manager activate --config /path/to/config.yaml \
+  --evidence /private/current-evidence.json \
+  --hermes-home /private/.hermes/profiles/default --apply
+```
+
+Apply acquires a private lock, re-reads the current evidence/spec/scripts, requires both exact jobs
+paused, atomically writes `manager-activation.json`, and verifies readback. It never resumes a job.
+Router and tick read `manager-current-evidence.json` beside the ledger by default (or the explicit
+router `--evidence` path) and revalidate every field on every run. Missing or stale evidence projects
+`unchecked`/`unsupported` with `wake_enabled=false` and denies before lease or budget mutation.
+
+Deactivation is also dry-run first and idempotent:
+
+```bash
+cyclops manager deactivate --config /path/to/config.yaml
+cyclops manager deactivate --config /path/to/config.yaml --apply
+```
+
 Task-, run-, board-, workspace-, or delegated-child-scoped router execution is denied before a
 lease or wake budget is acquired. The manager can return only `NOOP` or `ESCALATE`; it cannot
 complete, unblock, retry, publish, deploy, or edit anything.
@@ -107,6 +140,12 @@ systemctl --user disable skynet-cyclops.timer
 ```
 
 Stopping Cyclops does not stop Hermes or alter Kanban. Remove the generated projection and private ledger only after the timer is stopped. Kanban remains authoritative.
+
+For a manager-package rollback, first apply deactivation and verify the shared validator projects
+`wake_enabled=false`. Then pause router and courier using supported `cronjob` operations and obtain
+exact full-definition readback proving both are paused. Only then restore package/spec/scripts.
+Never resume v0.2.0 jobs: that release does not enforce activation attestation. If paused readback
+cannot be proven, leave v0.2.1 installed and fail the rollback closed.
 
 ## Troubleshooting
 
