@@ -88,12 +88,14 @@ cyclops manager courier --config /path/to/config.yaml # empty stdout when no int
 ### Activation
 
 Activation consumes an owner-private (`0600`), duplicate-key-free
-`cyclops-manager-current-evidence/v1` envelope produced from a supported, exact full-definition
-Hermes API/tool adapter. It must name `source=supported-full-definition-api`, the canonical
-`default` profile, collection time, current Hermes version, both exact paused job definitions with
-full `prompt_sha256`, and a complete `cyclops-hermes-seam-evidence/v1` report. The envelope expires
-after five minutes. A `cronjob list` prompt preview, the desired install spec, private cron storage,
-or session history is never sufficient evidence.
+`cyclops-manager-current-evidence/v1` envelope for the exact router/courier IDs and complete
+`cyclops-hermes-seam-evidence/v1` report. Any version, collection timestamp, or definition copy in
+that envelope is preflight context only and cannot authorize. On every dry run and apply collection,
+Cyclops executes the configured binary with fixed read-only argv: `hermes --version` and
+`hermes cron show EXACT_JOB_ID --json` for each ID. Only bounded, valid UTF-8, closed-schema
+`hermes-cron-definition/v1` responses containing the full prompts are normalized and hashed. A
+`cronjob list` prompt preview, desired install spec, private cron storage, replayed envelope, or
+session history is never sufficient evidence.
 
 ```bash
 # Both forms perform identical validation; the first writes nothing.
@@ -105,11 +107,15 @@ cyclops manager activate --config /path/to/config.yaml \
   --hermes-home /private/.hermes/profiles/default --apply
 ```
 
-Apply acquires a private lock, re-reads the current evidence/spec/scripts, requires both exact jobs
-paused, atomically writes `manager-activation.json`, and verifies readback. It never resumes a job.
-Router and tick read `manager-current-evidence.json` beside the ledger by default (or the explicit
-router `--evidence` path) and revalidate every field on every run. Missing or stale evidence projects
-`unchecked`/`unsupported` with `wake_enabled=false` and denies before lease or budget mutation.
+Apply acquires a private lock, re-reads the local bindings/spec/scripts, recollects the current Hermes
+version and both definitions, requires both exact jobs paused, atomically writes
+`manager-activation.json`, and verifies readback. It never resumes a job. Router and tick read the
+private binding envelope beside the ledger by default (or the explicit router `--evidence` path),
+then independently recollect version plus both definitions immediately before the shared validator
+on every invocation. Missing command, nonzero exit, timeout, oversized stdout/stderr, invalid UTF-8,
+malformed JSON, wrong protocol/ID/state/schema, or definition drift projects `unsupported` with
+`wake_enabled=false` and denies before lease or budget mutation. There is no replayable freshness
+window.
 
 Deactivation is also dry-run first and idempotent:
 

@@ -3,11 +3,15 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
+import subprocess
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
+from conftest import manifest_data
 
 import skynet_cyclops.activation as activation_module
 from skynet_cyclops.activation import (
@@ -15,6 +19,7 @@ from skynet_cyclops.activation import (
     RELEASE,
     ActivationInputs,
     ActivationVerdict,
+    HermesCronDefinitionAdapter,
     activate_manager,
     activation_verdict,
     canonical_sha256,
@@ -23,7 +28,11 @@ from skynet_cyclops.activation import (
     load_activation_inputs,
 )
 from skynet_cyclops.errors import ValidationError
+from skynet_cyclops.ledger import Ledger
+from skynet_cyclops.manager import IncidentObservation, manager_router_gate
 from skynet_cyclops.manager_install import build_cron_install_spec, stage_cron_install
+from skynet_cyclops.manifest import parse_manifest
+from skynet_cyclops.tick import run_tick
 
 
 def _job(job_id: str, name: str, *, prompt: str, no_agent: bool) -> dict[str, object]:
@@ -32,10 +41,12 @@ def _job(job_id: str, name: str, *, prompt: str, no_agent: bool) -> dict[str, ob
         "name": name,
         "schedule": "every 2m",
         "repeat": "forever",
-        "deliver": "local" if not no_agent else "telegram",
+        "deliver": ["local" if not no_agent else "telegram"],
         "skills": [],
         "model": None,
         "provider": None,
+        "provider_snapshot": None,
+        "model_snapshot": None,
         "base_url": None,
         "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
         "script": f"{name}.py",
@@ -90,10 +101,12 @@ def _inputs(tmp_path: Path) -> ActivationInputs:
             "name": arguments["name"],
             "schedule": arguments["schedule"],
             "repeat": "forever",
-            "deliver": arguments["deliver"],
+            "deliver": [arguments["deliver"]],
             "skills": arguments["skills"],
             "model": None,
             "provider": None,
+            "provider_snapshot": None,
+            "model_snapshot": None,
             "base_url": None,
             "prompt_sha256": hashlib.sha256(str(arguments["prompt"]).encode()).hexdigest(),
             "script": arguments["script"],
@@ -312,22 +325,47 @@ def test_activation_apply_rejects_job_definition_not_matching_install_spec(tmp_p
     assert not inputs.activation_path.exists()
 
 
-def test_stale_current_evidence_fails_closed(tmp_path: Path) -> None:
+def test_activation_binds_generated_provider_and_model_snapshots(tmp_path: Path) -> None:
+    inputs = _inputs(tmp_path)
+    inputs.activation_path.unlink()
+    jobs = {name: dict(job) for name, job in inputs.jobs.items()}
+    jobs["router"].update(provider_snapshot="synthetic-provider", model_snapshot="synthetic-model")
+    current = replace(inputs, jobs=jobs)
+
+    activate_manager(
+        current,
+        now="2026-08-20T09:00:00Z",
+        apply=True,
+        environment={},
+        refresh=lambda: current,
+    )
+
+    assert activation_verdict(current).reason == "supported"
+    drifted_jobs = {name: dict(job) for name, job in jobs.items()}
+    drifted_jobs["router"]["model_snapshot"] = "other-model"
+    assert activation_verdict(replace(current, jobs=drifted_jobs)).reason == "job_definition_drift"
+
+
+def test_static_evidence_timestamps_cannot_authorize_or_expire_a_current_readback(
+    tmp_path: Path,
+) -> None:
     inputs = replace(
         _inputs(tmp_path),
         evidence_collected_at="2026-08-20T08:00:00Z",
         validated_at="2026-08-20T09:00:00Z",
     )
-    assert activation_verdict(inputs).reason == "seam_evidence_drift"
+    assert activation_verdict(inputs).reason == "supported"
     inputs.activation_path.unlink()
-    with pytest.raises(ValidationError, match="stale"):
+    assert (
         activate_manager(
             inputs,
             now="2026-08-20T09:00:00Z",
             apply=True,
             environment={},
             refresh=lambda: inputs,
-        )
+        )["wake_enabled"]
+        is True
+    )
 
 
 def test_first_use_deactivation_is_a_valid_durable_deny(tmp_path: Path) -> None:
@@ -367,12 +405,14 @@ def test_private_current_evidence_loader_recollects_staged_inputs(tmp_path: Path
     )
     evidence_path.chmod(0o600)
     activation_path = tmp_path / "loaded-activation.json"
+    binary, _definitions = _fake_hermes(tmp_path, source)
 
     def collect() -> ActivationInputs:
         return load_activation_inputs(
             activation_path=activation_path,
             hermes_home=home,
             evidence_path=evidence_path,
+            hermes_binary=str(binary),
         )
 
     loaded = collect()
@@ -401,6 +441,8 @@ def test_private_current_evidence_loader_recollects_staged_inputs(tmp_path: Path
         lambda job: job.update(skills="bad"),
         lambda job: job.update(enabled_toolsets="bad"),
         lambda job: job.update(context_from="bad"),
+        lambda job: job.update(state="failed"),
+        lambda job: job.update(provider_snapshot=[]),
     ],
 )
 def test_full_job_definition_schema_is_closed(tmp_path: Path, mutate: object) -> None:
@@ -489,6 +531,383 @@ def _staged_current_evidence(tmp_path: Path) -> tuple[ActivationInputs, Path, Pa
     )
     evidence_path.chmod(0o600)
     return source, home, evidence_path
+
+
+def _definition_payload(
+    source: ActivationInputs, role: str, *, prompt: str | None = None
+) -> dict[str, object]:
+    job = source.jobs[role]
+    operations = source.install_spec["operations"]
+    assert isinstance(operations, list)
+    operation = operations[0 if role == "router" else 1]
+    assert isinstance(operation, dict)
+    arguments = operation["arguments"]
+    assert isinstance(arguments, dict)
+    return {
+        "protocol": "hermes-cron-definition/v1",
+        "job_id": job["job_id"],
+        "effective_state": "paused",
+        "definition": {
+            "name": arguments["name"],
+            "prompt": arguments["prompt"] if prompt is None else prompt,
+            "schedule": {"kind": "interval", "minutes": 2},
+            "repeat": {"times": None},
+            "skills": arguments["skills"],
+            "model": None,
+            "provider": None,
+            "provider_snapshot": None,
+            "model_snapshot": None,
+            "base_url": None,
+            "script": arguments["script"],
+            "no_agent": arguments["no_agent"],
+            "monitor_script": None,
+            "monitor_url": None,
+            "context_from": [],
+            "enabled_toolsets": arguments["enabled_toolsets"],
+            "workdir": None,
+            "attach_to_session": arguments["attach_to_session"],
+            "continuity": arguments["continuity"],
+            "deliver": [arguments["deliver"]],
+        },
+    }
+
+
+def _fake_hermes(tmp_path: Path, source: ActivationInputs) -> tuple[Path, Path]:
+    definitions = tmp_path / "definitions.json"
+    definitions.write_text(
+        json.dumps(
+            {
+                str(source.jobs["router"]["job_id"]): _definition_payload(source, "router"),
+                str(source.jobs["courier"]["job_id"]): _definition_payload(source, "courier"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    binary = tmp_path / "hermes"
+    binary.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, pathlib, sys\n"
+        "if sys.argv[1:] == ['--version']:\n"
+        "    print('Hermes Agent v0.9.0 (2026.8.20)')\n"
+        "    print('Install directory: /synthetic/hermes')\n"
+        "    print('Python: 3.11.15')\n"
+        "    print('OpenAI SDK: 2.24.0')\n"
+        "elif len(sys.argv) == 5 and sys.argv[1:3] == ['cron', 'show'] "
+        "and sys.argv[4] == '--json':\n"
+        "    path = pathlib.Path(__file__).with_name('definitions.json')\n"
+        "    values = json.loads(path.read_text())\n"
+        "    value = values.get(sys.argv[3])\n"
+        "    if value is None:\n"
+        "        raise SystemExit(1)\n"
+        "    print(json.dumps(value, sort_keys=True, separators=(',', ':')))\n"
+        "else:\n"
+        "    raise SystemExit(2)\n",
+        encoding="utf-8",
+    )
+    binary.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+    return binary, definitions
+
+
+def test_loader_recollects_version_and_both_exact_definitions_from_hermes_cli(
+    tmp_path: Path,
+) -> None:
+    source, home, evidence_path = _staged_current_evidence(tmp_path)
+    binary, _definitions = _fake_hermes(tmp_path, source)
+    stale = json.loads(evidence_path.read_text(encoding="utf-8"))
+    stale["hermes_version"] = "stale-version"
+    stale["jobs"]["router"]["schedule"] = "stale schedule"
+    evidence_path.write_text(json.dumps(stale), encoding="utf-8")
+
+    loaded = load_activation_inputs(
+        activation_path=source.activation_path,
+        hermes_home=home,
+        evidence_path=evidence_path,
+        hermes_binary=str(binary),
+    )
+
+    assert loaded.hermes_version == "0.9.0"
+    assert loaded.jobs["router"]["schedule"] == "every 2m"
+    assert loaded.jobs["router"]["prompt_sha256"] == source.jobs["router"]["prompt_sha256"]
+    assert loaded.jobs["courier"]["job_id"] == source.jobs["courier"]["job_id"]
+
+
+def test_definition_adapter_uses_fixed_argv_bounds_and_sanitized_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _inputs(tmp_path)
+    payloads = {
+        str(source.jobs["router"]["job_id"]): _definition_payload(source, "router"),
+        str(source.jobs["courier"]["job_id"]): _definition_payload(source, "courier"),
+    }
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+
+    def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        calls.append((argv, kwargs))
+        if argv[1:] == ["--version"]:
+            output = b"Hermes Agent v0.9.0 (2026.8.20)\n"
+        else:
+            output = json.dumps(payloads[argv[3]]).encode("utf-8")
+        return subprocess.CompletedProcess(argv, 0, stdout=output, stderr=b"")
+
+    monkeypatch.setattr(activation_module.subprocess, "run", fake_run)
+    adapter = HermesCronDefinitionAdapter(
+        environment={"PATH": "/usr/bin", "HOME": str(tmp_path), "API_TOKEN": "secret"}
+    )
+    version, jobs = adapter.collect(
+        {
+            "router": str(source.jobs["router"]["job_id"]),
+            "courier": str(source.jobs["courier"]["job_id"]),
+        }
+    )
+
+    assert version == "0.9.0"
+    assert jobs["router"]["prompt_sha256"] == source.jobs["router"]["prompt_sha256"]
+    assert [call[0][1:] for call in calls] == [
+        ["--version"],
+        ["cron", "show", "job-router", "--json"],
+        ["cron", "show", "job-courier", "--json"],
+    ]
+    assert all(call[1]["shell"] is False and call[1]["text"] is False for call in calls)
+    assert all("API_TOKEN" not in call[1]["env"] for call in calls)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda value: value.update(protocol="wrong"),
+        lambda value: value.update(job_id="other"),
+        lambda value: value.update(effective_state="failed"),
+        lambda value: value["definition"].update(extra=True),
+        lambda value: value["definition"].update(name="bad name"),
+        lambda value: value["definition"].update(prompt=1),
+        lambda value: value["definition"].update(schedule={"kind": "interval", "minutes": True}),
+        lambda value: value["definition"].update(repeat={"times": 0}),
+        lambda value: value["definition"].update(skills=["duplicate", "duplicate"]),
+        lambda value: value["definition"].update(model=[]),
+        lambda value: value["definition"].update(no_agent=1),
+        lambda value: value["definition"].update(continuity=1),
+        lambda value: value["definition"].update(attach_to_session=None),
+    ],
+)
+def test_definition_adapter_rejects_wrong_protocol_identity_state_and_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: object
+) -> None:
+    source = _inputs(tmp_path)
+    payload = _definition_payload(source, "router")
+    mutation(payload)  # type: ignore[operator]
+
+    def fake_run(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        output = (
+            b"Hermes Agent v0.9.0 (2026.8.20)\n"
+            if argv[1:] == ["--version"]
+            else json.dumps(payload).encode("utf-8")
+        )
+        return subprocess.CompletedProcess(argv, 0, stdout=output, stderr=b"")
+
+    monkeypatch.setattr(activation_module.subprocess, "run", fake_run)
+    with pytest.raises(ValidationError, match="definition"):
+        HermesCronDefinitionAdapter().collect({"router": "job-router", "courier": "job-courier"})
+
+
+@pytest.mark.parametrize(
+    ("completed", "message"),
+    [
+        (subprocess.CompletedProcess([], 1, stdout=b"private", stderr=b"private"), "failed"),
+        (subprocess.CompletedProcess([], 0, stdout=b"x" * 1025, stderr=b""), "output bound"),
+        (subprocess.CompletedProcess([], 0, stdout=b"\xff", stderr=b""), "UTF-8"),
+        (subprocess.CompletedProcess([], 0, stdout=b"not-json", stderr=b""), "JSON"),
+    ],
+)
+def test_definition_adapter_rejects_command_and_output_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    completed: subprocess.CompletedProcess[bytes],
+    message: str,
+) -> None:
+    def fake_run(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        if argv[1:] == ["--version"] and message == "JSON":
+            return subprocess.CompletedProcess(
+                argv, 0, stdout=b"Hermes Agent v0.9.0 (2026.8.20)\n", stderr=b""
+            )
+        return completed
+
+    monkeypatch.setattr(activation_module.subprocess, "run", fake_run)
+    with pytest.raises(ValidationError, match=message):
+        HermesCronDefinitionAdapter(max_output_bytes=1024).collect(
+            {"router": "job-router", "courier": "job-courier"}
+        )
+
+
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        (subprocess.TimeoutExpired(["hermes"], 1), "timed out"),
+        (FileNotFoundError("synthetic private path"), "unavailable"),
+    ],
+)
+def test_definition_adapter_rejects_timeout_and_missing_command(
+    monkeypatch: pytest.MonkeyPatch, failure: BaseException, message: str
+) -> None:
+    def fail(*_args: Any, **_kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        raise failure
+
+    monkeypatch.setattr(activation_module.subprocess, "run", fail)
+    with pytest.raises(ValidationError, match=message) as caught:
+        HermesCronDefinitionAdapter().collect({"router": "job-router", "courier": "job-courier"})
+    assert "synthetic private path" not in str(caught.value)
+
+
+def test_definition_adapter_rejects_invalid_configuration_identity_and_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValidationError, match="binary"):
+        HermesCronDefinitionAdapter(binary="")
+    with pytest.raises(ValidationError, match="bounds"):
+        HermesCronDefinitionAdapter(timeout_seconds=0)
+    adapter = HermesCronDefinitionAdapter()
+    with pytest.raises(ValidationError, match="incomplete"):
+        adapter.collect({"router": "job-router"})
+    with pytest.raises(ValidationError, match="identity"):
+        adapter.collect({"router": "bad id", "courier": "job-courier"})
+    with pytest.raises(ValidationError, match="distinct"):
+        adapter.collect({"router": "same", "courier": "same"})
+
+    monkeypatch.setattr(
+        activation_module.subprocess,
+        "run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(
+            argv, 0, stdout=b"unsupported version output\n", stderr=b""
+        ),
+    )
+    with pytest.raises(ValidationError, match="version"):
+        adapter.collect({"router": "job-router", "courier": "job-courier"})
+
+
+@pytest.mark.parametrize(
+    ("schedule", "repeat", "expected_schedule", "expected_repeat"),
+    [
+        ({"kind": "cron", "expr": "*/2 * * * *"}, {"times": 2}, "*/2 * * * *", 2),
+        (
+            {"kind": "once", "run_at": "2026-08-21T00:00:00Z"},
+            {"times": None},
+            "2026-08-21T00:00:00Z",
+            "forever",
+        ),
+        ({"kind": "legacy", "value": "every 2m"}, {"times": None}, "every 2m", "forever"),
+    ],
+)
+def test_definition_adapter_normalizes_supported_schedule_and_repeat_forms(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    schedule: dict[str, object],
+    repeat: dict[str, object],
+    expected_schedule: object,
+    expected_repeat: object,
+) -> None:
+    source = _inputs(tmp_path)
+    payload = _definition_payload(source, "router")
+    payload["definition"]["schedule"] = schedule  # type: ignore[index]
+    payload["definition"]["repeat"] = repeat  # type: ignore[index]
+
+    def fake_run(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        output = (
+            b"Hermes Agent v0.9.0 (2026.8.20)\n"
+            if argv[1:] == ["--version"]
+            else json.dumps({**payload, "job_id": argv[3]}).encode("utf-8")
+        )
+        return subprocess.CompletedProcess(argv, 0, stdout=output, stderr=b"")
+
+    monkeypatch.setattr(activation_module.subprocess, "run", fake_run)
+    _version, jobs = HermesCronDefinitionAdapter().collect(
+        {"router": "job-router", "courier": "job-courier"}
+    )
+    assert jobs["router"]["schedule"] == expected_schedule
+    assert jobs["router"]["repeat"] == expected_repeat
+
+
+def test_definition_adapter_preserves_all_normalized_delivery_classes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _inputs(tmp_path)
+    payload = _definition_payload(source, "router")
+    payload["definition"]["deliver"] = ["telegram", "local"]  # type: ignore[index]
+
+    def fake_run(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        output = (
+            b"Hermes Agent v0.9.0 (2026.8.20)\n"
+            if argv[1:] == ["--version"]
+            else json.dumps({**payload, "job_id": argv[3]}).encode("utf-8")
+        )
+        return subprocess.CompletedProcess(argv, 0, stdout=output, stderr=b"")
+
+    monkeypatch.setattr(activation_module.subprocess, "run", fake_run)
+    _version, jobs = HermesCronDefinitionAdapter().collect(
+        {"router": "job-router", "courier": "job-courier"}
+    )
+    assert jobs["router"]["deliver"] == ["telegram", "local"]
+
+
+def test_actual_prompt_drift_after_attestation_denies_router_and_matches_projection(
+    tmp_path: Path,
+) -> None:
+    source, home, evidence_path = _staged_current_evidence(tmp_path)
+    binary, definitions_path = _fake_hermes(tmp_path, source)
+
+    def current_verdict() -> ActivationVerdict:
+        return activation_verdict(
+            load_activation_inputs(
+                activation_path=source.activation_path,
+                hermes_home=home,
+                evidence_path=evidence_path,
+                hermes_binary=str(binary),
+            )
+        )
+
+    assert current_verdict().reason == "supported"
+    definitions = json.loads(definitions_path.read_text(encoding="utf-8"))
+    router_id = str(source.jobs["router"]["job_id"])
+    definitions[router_id]["definition"]["prompt"] += " drift"
+    definitions_path.write_text(json.dumps(definitions), encoding="utf-8")
+
+    ledger_path = tmp_path / "router-ledger.db"
+    with Ledger.create(ledger_path) as ledger:
+        ledger.register_mission("synthetic-release", "b" * 64)
+        incident = IncidentObservation(
+            mission_id="synthetic-release",
+            phase_key="verify",
+            kind="phase_failed",
+            subject_task_id="t_example",
+            subject_run_id=None,
+            severity="critical",
+            observation_sha256="a" * 64,
+            expected_state="done",
+            observed_state="failed",
+        )
+        ledger.observe_manager_incidents([incident], tick_seq=1, now=100.0)
+        ledger.observe_manager_incidents([incident], tick_seq=2, now=101.0)
+        assert manager_router_gate(
+            ledger, now=101.0, environment={}, activation_check=current_verdict
+        ) == {"wakeAgent": False}
+        assert ledger.manager_budget("synthetic-release", "1970-01-01") == 0
+        assert ledger._connection.execute("SELECT COUNT(*) FROM wake_attempts").fetchone() == (0,)
+
+    class UnusedCollector:
+        def collect(self, board: str, task_ids: list[str]) -> dict[str, object]:
+            raise AssertionError((board, task_ids))
+
+    projection = run_tick(
+        parse_manifest(manifest_data()),
+        tmp_path / "missing-ledger.db",
+        tmp_path / "status.json",
+        UnusedCollector(),
+        now=101.0,
+        activation_check=current_verdict,
+    )
+    verdict = current_verdict()
+    assert verdict.reason == "job_definition_drift"
+    assert (
+        projection["supervisor"]["compatibility_state"],
+        projection["supervisor"]["wake_enabled"],
+    ) == verdict.public
 
 
 @pytest.mark.parametrize(

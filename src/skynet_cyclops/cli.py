@@ -197,6 +197,7 @@ def _execute(args: argparse.Namespace) -> ExitCode:
                     activation_path=activation_path,
                     hermes_home=profile_home,
                     evidence_path=evidence_path,
+                    hermes_binary=config.hermes_binary,
                 )
 
             inputs = collect_activation_inputs()
@@ -224,6 +225,7 @@ def _execute(args: argparse.Namespace) -> ExitCode:
                     activation_path=activation_path,
                     hermes_home=profile_home,
                     evidence_path=evidence_path,
+                    hermes_binary=config.hermes_binary,
                 )
             )
 
@@ -257,6 +259,7 @@ def _execute(args: argparse.Namespace) -> ExitCode:
                     activation_path=activation_path,
                     hermes_home=profile_home,
                     evidence_path=evidence_path,
+                    hermes_binary=config.hermes_binary,
                 )
             ),
         )

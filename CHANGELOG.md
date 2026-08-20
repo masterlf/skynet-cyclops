@@ -14,10 +14,12 @@ All notable changes to this project are documented here. The project follows Sem
 
 ### Security
 
-- Missing, malformed, stale, symlinked, shared, or drifted activation evidence denies before any
-  manager lifecycle, lease, or budget mutation and exposes only public compatibility state.
-- Activation requires fresh supported full-definition evidence and both exact jobs paused; prompt
-  previews and desired install specifications cannot authorize a wake.
+- Every router and status tick recollects the current Hermes version and both exact full definitions
+  through bounded `hermes cron show EXACT_JOB_ID --json` calls immediately before validation.
+- Missing commands, failures, malformed/oversized output, wrong protocol/ID/state, or drift deny
+  before manager lifecycle, lease, or budget mutation; static evidence freshness cannot authorize.
+- Activation apply repeats the live readback and requires both exact jobs paused; prompt previews,
+  replayed envelopes, desired install specifications, and private Hermes stores cannot authorize.
 - Deactivation commits an immediate durable deny without mutating Hermes. Rollback requires that
   deny plus supported proof that both jobs are paused before any downgrade.
 

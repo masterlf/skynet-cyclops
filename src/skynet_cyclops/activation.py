@@ -12,14 +12,16 @@ import json
 import os
 import re
 import stat
+import subprocess  # Fixed read-only Hermes argv with shell=False.  # nosec B404
 import tempfile
+import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
+from .adapter import sanitize_environment
 from .errors import ValidationError
 
 ACTIVATION_PROTOCOL = "cyclops-manager-activation/v1"
@@ -27,9 +29,16 @@ SEAM_PROTOCOL = "cyclops-hermes-seam-evidence/v1"
 RELEASE = "0.2.1"
 MAX_ACTIVATION_BYTES = 16 * 1024
 MAX_EVIDENCE_BYTES = 256 * 1024
+MAX_HERMES_READBACK_BYTES = 1024 * 1024
+HERMES_READBACK_TIMEOUT_SECONDS = 10
+HERMES_READBACK_COLLECTION_SECONDS = 30
+HERMES_DEFINITION_PROTOCOL = "hermes-cron-definition/v1"
 _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+_VERSION_LINE = re.compile(
+    r"^Hermes Agent v([A-Za-z0-9][A-Za-z0-9.+-]{0,63})(?: \([^\r\n]{1,64}\))?$"
+)
 _TASK_SCOPE_MARKERS = frozenset(
     {
         "HERMES_KANBAN_TASK",
@@ -56,6 +65,8 @@ _JOB_DEFINITION_FIELDS = frozenset(
         "skills",
         "model",
         "provider",
+        "provider_snapshot",
+        "model_snapshot",
         "base_url",
         "prompt_sha256",
         "script",
@@ -67,6 +78,30 @@ _JOB_DEFINITION_FIELDS = frozenset(
         "continuity",
         "context_from",
         "attach_to_session",
+    }
+)
+_HERMES_DEFINITION_FIELDS = frozenset(
+    {
+        "name",
+        "prompt",
+        "schedule",
+        "repeat",
+        "skills",
+        "model",
+        "provider",
+        "provider_snapshot",
+        "model_snapshot",
+        "base_url",
+        "script",
+        "no_agent",
+        "monitor_script",
+        "monitor_url",
+        "context_from",
+        "enabled_toolsets",
+        "workdir",
+        "attach_to_session",
+        "continuity",
+        "deliver",
     }
 )
 _RECORD_KEYS = frozenset(
@@ -138,23 +173,261 @@ def canonical_sha256(value: object) -> str:
     return hashlib.sha256(canonical_bytes(value)).hexdigest()
 
 
+class HermesCronDefinitionAdapter:
+    """Collect only version and exact cron definitions through supported CLI calls."""
+
+    def __init__(
+        self,
+        binary: str = "hermes",
+        *,
+        timeout_seconds: int = HERMES_READBACK_TIMEOUT_SECONDS,
+        collection_timeout_seconds: int = HERMES_READBACK_COLLECTION_SECONDS,
+        max_output_bytes: int = MAX_HERMES_READBACK_BYTES,
+        environment: Mapping[str, str] | None = None,
+    ) -> None:
+        if not binary or len(binary) > 4096 or "\x00" in binary:
+            raise ValidationError("Hermes definition reader binary is invalid")
+        if (
+            not 1 <= timeout_seconds <= 30
+            or not 1 <= collection_timeout_seconds <= 60
+            or not 1024 <= max_output_bytes <= 4 * 1024 * 1024
+        ):
+            raise ValidationError("Hermes definition reader bounds are invalid")
+        self.binary = binary
+        self.timeout_seconds = timeout_seconds
+        self.collection_timeout_seconds = collection_timeout_seconds
+        self.max_output_bytes = max_output_bytes
+        self.environment = sanitize_environment(environment)
+
+    def _run(self, arguments: tuple[str, ...], *, deadline: float) -> str:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ValidationError("Hermes definition collection deadline exceeded")
+        try:
+            completed = subprocess.run(  # noqa: S603
+                [self.binary, *arguments],
+                shell=False,  # Fixed adapter-owned argv; never a shell.  # nosec B603
+                env=self.environment,
+                capture_output=True,
+                text=False,
+                timeout=min(float(self.timeout_seconds), remaining),
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ValidationError("Hermes definition collection timed out") from exc
+        except OSError as exc:
+            raise ValidationError("Hermes definition command is unavailable") from exc
+        stdout = completed.stdout if isinstance(completed.stdout, bytes) else b""
+        stderr = completed.stderr if isinstance(completed.stderr, bytes) else b""
+        if len(stdout) > self.max_output_bytes or len(stderr) > self.max_output_bytes:
+            raise ValidationError("Hermes definition command exceeded its output bound")
+        try:
+            output = stdout.decode("utf-8")
+            stderr.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValidationError("Hermes definition command returned invalid UTF-8") from exc
+        if completed.returncode != 0:
+            raise ValidationError("Hermes definition command failed")
+        return output
+
+    def collect(self, job_ids: Mapping[str, str]) -> tuple[str, dict[str, dict[str, object]]]:
+        if set(job_ids) != {"router", "courier"}:
+            raise ValidationError("Hermes definition identities are incomplete")
+        safe_ids: dict[str, str] = {}
+        for role in ("router", "courier"):
+            job_id = job_ids[role]
+            if not isinstance(job_id, str) or not _SAFE_ID.fullmatch(job_id):
+                raise ValidationError("Hermes definition identity is invalid")
+            safe_ids[role] = job_id
+        if safe_ids["router"] == safe_ids["courier"]:
+            raise ValidationError("Hermes definition identities must be distinct")
+        deadline = time.monotonic() + self.collection_timeout_seconds
+        version_output = self._run(("--version",), deadline=deadline)
+        lines = version_output.splitlines()
+        version_match = _VERSION_LINE.fullmatch(lines[0] if lines else "")
+        if version_match is None:
+            raise ValidationError("Hermes version output is unsupported")
+        jobs: dict[str, dict[str, object]] = {}
+        for role in ("router", "courier"):
+            raw = self._run(("cron", "show", safe_ids[role], "--json"), deadline=deadline)
+            try:
+                value = json.loads(raw, object_pairs_hook=_duplicates)
+            except (json.JSONDecodeError, ValueError) as exc:
+                raise ValidationError("Hermes definition JSON is malformed") from exc
+            jobs[role] = _normalize_hermes_definition(value, expected_job_id=safe_ids[role])
+        return version_match.group(1), jobs
+
+
+def _bounded_text_list(value: object) -> list[str] | None:
+    if not isinstance(value, list) or len(value) > 32:
+        return None
+    result: list[str] = []
+    for item in value:
+        if (
+            not isinstance(item, str)
+            or len(item.encode("utf-8")) > 4096
+            or any(ord(character) < 32 for character in item)
+            or item in result
+        ):
+            return None
+        result.append(item)
+    return result
+
+
+def _optional_text(value: object) -> str | Literal[False] | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or len(value.encode("utf-8")) > 4096
+        or any(ord(character) < 32 for character in value)
+    ):
+        return False
+    return value
+
+
+def _normalize_schedule(value: object) -> object | None:
+    if not isinstance(value, dict) or not isinstance(value.get("kind"), str):
+        return None
+    kind = value["kind"]
+    if kind == "interval" and set(value) == {"kind", "minutes"}:
+        minutes = value["minutes"]
+        if isinstance(minutes, int) and not isinstance(minutes, bool) and 1 <= minutes <= 525600:
+            return f"every {minutes}m"
+    elif kind == "cron" and set(value) == {"kind", "expr"}:
+        expression = _optional_text(value["expr"])
+        if isinstance(expression, str) and expression:
+            return expression
+    elif kind == "once" and set(value) == {"kind", "run_at"}:
+        run_at = _optional_text(value["run_at"])
+        if isinstance(run_at, str) and run_at:
+            return run_at
+    elif kind == "legacy" and set(value) == {"kind", "value"}:
+        legacy = _optional_text(value["value"])
+        if isinstance(legacy, str) and legacy:
+            return legacy
+    return None
+
+
+def _normalize_hermes_definition(value: object, *, expected_job_id: str) -> dict[str, object]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"protocol", "job_id", "effective_state", "definition"}
+        or value.get("protocol") != HERMES_DEFINITION_PROTOCOL
+        or value.get("job_id") != expected_job_id
+        or value.get("effective_state") not in {"paused", "scheduled"}
+        or not isinstance(value.get("definition"), dict)
+    ):
+        raise ValidationError("Hermes definition envelope is unsupported")
+    definition = value["definition"]
+    if not isinstance(definition, dict) or set(definition) != _HERMES_DEFINITION_FIELDS:
+        raise ValidationError("Hermes definition schema is unsupported")
+    name = definition["name"]
+    prompt = definition["prompt"]
+    schedule = _normalize_schedule(definition["schedule"])
+    repeat = definition["repeat"]
+    deliveries = _bounded_text_list(definition["deliver"])
+    skills = _bounded_text_list(definition["skills"])
+    enabled_toolsets = _bounded_text_list(definition["enabled_toolsets"])
+    context_from = _bounded_text_list(definition["context_from"])
+    optional = {
+        field: _optional_text(definition[field])
+        for field in (
+            "model",
+            "provider",
+            "provider_snapshot",
+            "model_snapshot",
+            "base_url",
+            "script",
+            "monitor_script",
+            "monitor_url",
+            "workdir",
+        )
+    }
+    times = repeat.get("times") if isinstance(repeat, dict) and set(repeat) == {"times"} else False
+    if (
+        not isinstance(name, str)
+        or not _SAFE_ID.fullmatch(name)
+        or not isinstance(prompt, str)
+        or len(prompt.encode("utf-8")) > MAX_HERMES_READBACK_BYTES
+        or schedule is None
+        or times is False
+        or not (
+            times is None or (isinstance(times, int) and not isinstance(times, bool) and times >= 1)
+        )
+        or skills is None
+        or enabled_toolsets is None
+        or context_from is None
+        or deliveries is None
+        or any(item is False for item in optional.values())
+        or type(definition["no_agent"]) is not bool
+        or type(definition["continuity"]) is not bool
+        or type(definition["attach_to_session"]) is not bool
+    ):
+        raise ValidationError("Hermes definition fields are unsupported")
+    return {
+        "job_id": expected_job_id,
+        "name": name,
+        "schedule": schedule,
+        "repeat": "forever" if times is None else times,
+        "deliver": deliveries,
+        "skills": skills,
+        **optional,
+        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "no_agent": definition["no_agent"],
+        "enabled_toolsets": enabled_toolsets,
+        "continuity": definition["continuity"],
+        "context_from": context_from,
+        "attach_to_session": definition["attach_to_session"],
+        "state": value["effective_state"],
+        "enabled": value["effective_state"] == "scheduled",
+    }
+
+
 def _normalized_job(value: Mapping[str, object]) -> dict[str, object] | None:
     if set(value) != _JOB_DEFINITION_FIELDS | {"state", "enabled"}:
         return None
     normalized = {key: value[key] for key in sorted(_JOB_DEFINITION_FIELDS)}
+    optional = (
+        "model",
+        "provider",
+        "provider_snapshot",
+        "model_snapshot",
+        "base_url",
+        "script",
+        "monitor_script",
+        "monitor_url",
+        "workdir",
+    )
     if (
         not isinstance(normalized["job_id"], str)
         or not _SAFE_ID.fullmatch(str(normalized["job_id"]))
         or not isinstance(normalized["name"], str)
         or not _SAFE_ID.fullmatch(str(normalized["name"]))
+        or not isinstance(normalized["schedule"], str)
+        or not normalized["schedule"]
+        or len(str(normalized["schedule"]).encode("utf-8")) > 4096
+        or not (
+            normalized["repeat"] == "forever"
+            or (
+                isinstance(normalized["repeat"], int)
+                and not isinstance(normalized["repeat"], bool)
+                and normalized["repeat"] >= 1
+            )
+        )
+        or not _bounded_text_list(normalized["deliver"])
         or not isinstance(normalized["prompt_sha256"], str)
         or not _HEX_64.fullmatch(str(normalized["prompt_sha256"]))
         or type(normalized["no_agent"]) is not bool
         or type(normalized["continuity"]) is not bool
         or type(normalized["attach_to_session"]) is not bool
-        or not isinstance(normalized["skills"], list)
-        or not isinstance(normalized["enabled_toolsets"], list)
-        or not isinstance(normalized["context_from"], list)
+        or _bounded_text_list(normalized["skills"]) is None
+        or _bounded_text_list(normalized["enabled_toolsets"]) is None
+        or _bounded_text_list(normalized["context_from"]) is None
+        or any(_optional_text(normalized[field]) is False for field in optional)
+        or value["state"] not in {"paused", "scheduled"}
+        or type(value["enabled"]) is not bool
+        or value["enabled"] is not (value["state"] == "scheduled")
     ):
         return None
     return normalized
@@ -198,15 +471,25 @@ def _expected_job(arguments: Mapping[str, object], job_id: str) -> dict[str, obj
     prompt = arguments.get("prompt")
     if not isinstance(prompt, str):
         raise ValidationError("activation full prompt is unverifiable")
+    delivery = arguments.get("deliver")
+    if isinstance(delivery, str):
+        delivery_classes: list[str] = []
+        for target in delivery.split(","):
+            normalized_target = target.strip().split(":", 1)[0]
+            if normalized_target and normalized_target not in delivery_classes:
+                delivery_classes.append(normalized_target)
+        delivery = delivery_classes or ["local"]
     return {
         "job_id": job_id,
         "name": arguments.get("name"),
         "schedule": arguments.get("schedule"),
         "repeat": "forever" if arguments.get("repeat") == 0 else arguments.get("repeat"),
-        "deliver": arguments.get("deliver"),
+        "deliver": delivery,
         "skills": arguments.get("skills"),
         "model": arguments.get("model"),
         "provider": arguments.get("provider"),
+        "provider_snapshot": None,
+        "model_snapshot": None,
         "base_url": arguments.get("base_url"),
         "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
         "script": arguments.get("script"),
@@ -231,22 +514,6 @@ def _verdict(reason: _REASONS) -> ActivationVerdict:
     if reason == "disabled":
         return ActivationVerdict(reason, "supported", False)
     return ActivationVerdict(reason, "unsupported", False)
-
-
-def _evidence_is_fresh(inputs: ActivationInputs) -> bool:
-    if inputs.evidence_collected_at is None and inputs.validated_at is None:
-        return True
-    if inputs.evidence_collected_at is None or inputs.validated_at is None:
-        return False
-    try:
-        collected = datetime.strptime(inputs.evidence_collected_at, "%Y-%m-%dT%H:%M:%SZ").replace(
-            tzinfo=UTC
-        )
-        validated = datetime.strptime(inputs.validated_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
-    except ValueError:
-        return False
-    age = (validated - collected).total_seconds()
-    return 0 <= age <= 300
 
 
 def _duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -396,8 +663,6 @@ def activation_verdict(inputs: ActivationInputs) -> ActivationVerdict:
         return _verdict("disabled")
     if record["hermes_version"] != inputs.hermes_version:
         return _verdict("hermes_drift")
-    if not _evidence_is_fresh(inputs):
-        return _verdict("seam_evidence_drift")
     if record["manager_install_spec_sha256"] != canonical_sha256(inputs.install_spec):
         return _verdict("spec_drift")
     if not _scripts_match_spec(inputs):
@@ -455,9 +720,13 @@ def _read_private_json(path: Path, *, maximum_bytes: int) -> object:
 
 
 def load_activation_inputs(
-    *, activation_path: Path, hermes_home: Path, evidence_path: Path
+    *,
+    activation_path: Path,
+    hermes_home: Path,
+    evidence_path: Path,
+    hermes_binary: str = "hermes",
 ) -> ActivationInputs:
-    """Load current private evidence without opening Hermes or Kanban stores."""
+    """Load static local bindings, then recollect current Hermes state through its CLI."""
     from .manager_install import seam_evidence_is_valid, validate_cron_install_spec
 
     evidence = _read_private_json(evidence_path, maximum_bytes=MAX_EVIDENCE_BYTES)
@@ -514,17 +783,25 @@ def load_activation_inputs(
     jobs = evidence["jobs"]
     if not isinstance(jobs, dict):
         raise ValidationError("activation evidence jobs are invalid")
+    job_ids: dict[str, str] = {}
+    for name in ("router", "courier"):
+        job = jobs.get(name)
+        job_id = job.get("job_id") if isinstance(job, Mapping) else None
+        if not isinstance(job_id, str) or not _SAFE_ID.fullmatch(job_id):
+            raise ValidationError("activation evidence job identity is invalid")
+        job_ids[name] = job_id
+    hermes_version, current_jobs = HermesCronDefinitionAdapter(binary=hermes_binary).collect(
+        job_ids
+    )
     return ActivationInputs(
         activation_path=activation_path,
         release=RELEASE,
         profile="default",
-        hermes_version=str(evidence["hermes_version"]),
+        hermes_version=hermes_version,
         install_spec=spec,
         scripts=scripts,
-        jobs={name: dict(value) for name, value in jobs.items() if isinstance(value, Mapping)},
+        jobs=current_jobs,
         seam_evidence=dict(evidence["seam_evidence"]),
-        evidence_collected_at=str(evidence["collected_at"]),
-        validated_at=datetime.now(UTC).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ"),
     )
 
 
@@ -627,8 +904,6 @@ def _enabled_record(inputs: ActivationInputs, now: str) -> dict[str, object]:
         raise ValidationError("activation evidence is unsupported")
     if not _scripts_match_spec(inputs):
         raise ValidationError("activation script evidence is invalid")
-    if not _evidence_is_fresh(inputs):
-        raise ValidationError("activation evidence is stale")
     try:
         spec = validate_cron_install_spec(dict(inputs.install_spec))
     except ValidationError as exc:
@@ -660,7 +935,9 @@ def _enabled_record(inputs: ActivationInputs, now: str) -> dict[str, object]:
         ):
             raise ValidationError("activation install definitions are invalid")
         expected_job = _expected_job(operation["arguments"], job_id)
-        if job_definition_sha256(job) != job_definition_sha256(expected_job):
+        configured_job = dict(job)
+        configured_job.update(provider_snapshot=None, model_snapshot=None)
+        if job_definition_sha256(configured_job) != job_definition_sha256(expected_job):
             raise ValidationError("activation job definition does not match install spec")
         identifiers.add(job_id)
         bindings[name] = {"job_id": job_id, "definition_sha256": job_definition_sha256(job)}
