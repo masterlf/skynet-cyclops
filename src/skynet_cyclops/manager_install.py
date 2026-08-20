@@ -24,7 +24,7 @@ from .errors import ValidationError
 from .manager import MANAGER_PROMPT
 
 _PROTOCOL = "cyclops-cron-install/v1"
-_RELEASE = "0.2.0"
+_RELEASE = "0.2.1"
 _STABLE_NAMES = ("cyclops-manager-router", "cyclops-decision-courier")
 _HEX = frozenset("0123456789abcdef")
 _SPEC_KEYS = frozenset(
@@ -1042,3 +1042,13 @@ def execute_cron_install_spec(
         "created_job_ids": list(created.values()),
         "rollback_failures": rollback_failures,
     }
+
+
+def validate_cron_install_spec(value: object) -> dict[str, object]:
+    """Public strict validator for staged activation evidence consumers."""
+    return _validate_cron_install_spec(value)
+
+
+def seam_evidence_is_valid(value: object) -> bool:
+    """Return whether a report matches the reviewed installed-Hermes seam contract."""
+    return _seam_evidence_is_valid(value)

@@ -3,7 +3,7 @@
   "label": "Skynet-Cyclops",
   "description": "Read-only observe-first mission status",
   "icon": "Eye",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "tab": {
     "path": "/skynet-cyclops",
     "position": "after:kanban"

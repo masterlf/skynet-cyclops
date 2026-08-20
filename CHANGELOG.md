@@ -2,6 +2,27 @@
 
 All notable changes to this project are documented here. The project follows Semantic Versioning after public releases.
 
+## [0.2.1] - 2026-08-20
+
+### Added
+
+- Owner-private, atomic `cyclops-manager-activation/v1` attestation and dry-run-first
+  `manager activate` / `manager deactivate` commands.
+- One fail-closed validator shared by router authorization and status projection, binding the
+  Cyclops release, staged install spec/scripts, Hermes version, canonical profile, exact full job
+  definitions and installed-Hermes seam evidence.
+
+### Security
+
+- Every router and status tick recollects the current Hermes version and both exact full definitions
+  through bounded `hermes cron show EXACT_JOB_ID --json` calls immediately before validation.
+- Missing commands, failures, malformed/oversized output, wrong protocol/ID/state, or drift deny
+  before manager lifecycle, lease, or budget mutation; static evidence freshness cannot authorize.
+- Activation apply repeats the live readback and requires both exact jobs paused; prompt previews,
+  replayed envelopes, desired install specifications, and private Hermes stores cannot authorize.
+- Deactivation commits an immediate durable deny without mutating Hermes. Rollback requires that
+  deny plus supported proof that both jobs are paused before any downgrade.
+
 ## [0.2.0] - 2026-08-19
 
 ### Added

@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+import skynet_cyclops.manager as manager_module
+from skynet_cyclops.activation import ActivationVerdict
 from skynet_cyclops.errors import LedgerError, ValidationError
 from skynet_cyclops.ledger import Ledger
 from skynet_cyclops.manager import (
@@ -69,6 +71,11 @@ def unscoped_router_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         "HERMES_DELEGATION_PARENT",
     ):
         monkeypatch.delenv(marker, raising=False)
+    monkeypatch.setattr(
+        manager_module,
+        "runtime_activation_verdict",
+        lambda: ActivationVerdict("supported", "supported", True),
+    )
 
 
 def test_stable_identity_excludes_fingerprint_severity_and_status() -> None:
@@ -157,6 +164,28 @@ def test_task_scope_marker_presence_is_denied_even_when_value_is_empty(tmp_path:
             now=101.0,
             environment={"HERMES_KANBAN_TASK": ""},
         ) == {"wakeAgent": False}
+        assert ledger.manager_budget("synthetic-release", "1970-01-01") == 0
+
+
+def test_activation_denial_and_validator_exception_precede_lease_and_budget(tmp_path: Path) -> None:
+    with create_ledger(tmp_path / "ledger.db") as ledger:
+        ledger.observe_manager_incidents([observation()], tick_seq=1, now=100.0)
+        ledger.observe_manager_incidents([observation()], tick_seq=2, now=101.0)
+
+        def denied() -> ActivationVerdict:
+            return ActivationVerdict("absent", "unchecked", False)
+
+        assert manager_router_gate(ledger, now=101.0, activation_check=denied) == {
+            "wakeAgent": False
+        }
+        assert ledger.manager_budget("synthetic-release", "1970-01-01") == 0
+
+        def broken() -> ActivationVerdict:
+            raise RuntimeError("private synthetic detail")
+
+        assert manager_router_gate(ledger, now=101.0, activation_check=broken) == {
+            "wakeAgent": False
+        }
         assert ledger.manager_budget("synthetic-release", "1970-01-01") == 0
 
 

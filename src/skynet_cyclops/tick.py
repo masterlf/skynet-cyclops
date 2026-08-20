@@ -5,9 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol, cast
 
+from .activation import ActivationVerdict
 from .errors import LedgerError
 from .ledger import Ledger
 from .manager import IncidentObservation
@@ -20,7 +22,14 @@ class Collector(Protocol):
     def collect(self, board: str, task_ids: list[str]) -> dict[str, object]: ...
 
 
-def _base_projection(now: float, tick_seq: int, *, state: str, post_gap: bool) -> dict[str, Any]:
+def _base_projection(
+    now: float,
+    tick_seq: int,
+    *,
+    state: str,
+    post_gap: bool,
+    activation: ActivationVerdict,
+) -> dict[str, Any]:
     return {
         "schema_version": 2,
         "projection_version": 2,
@@ -30,8 +39,8 @@ def _base_projection(now: float, tick_seq: int, *, state: str, post_gap: bool) -
             "heartbeat_at": now,
             "tick_seq": tick_seq,
             "post_gap": post_gap,
-            "compatibility_state": "unchecked",
-            "wake_enabled": False,
+            "compatibility_state": activation.compatibility_state,
+            "wake_enabled": activation.wake_enabled,
         },
         "missions": [],
         "incidents": [],
@@ -73,13 +82,24 @@ def run_tick(
     *,
     now: float | None = None,
     debounce_ticks: int = 2,
+    activation_check: Callable[[], ActivationVerdict] | None = None,
 ) -> dict[str, Any]:
     timestamp = time.time() if now is None else now
     digest = canonical_manifest_hash(manifest)
     try:
+        activation = (
+            ActivationVerdict("absent", "unchecked", False)
+            if activation_check is None
+            else activation_check()
+        )
+    except Exception:
+        activation = ActivationVerdict("malformed", "unsupported", False)
+    try:
         ledger = Ledger.open(ledger_path)
     except LedgerError:
-        payload = _base_projection(timestamp, 0, state="critical", post_gap=False)
+        payload = _base_projection(
+            timestamp, 0, state="critical", post_gap=False, activation=activation
+        )
         payload["missions"] = [
             {
                 "id": manifest.mission.id,
@@ -97,7 +117,9 @@ def run_tick(
         return payload
     with ledger:
         if ledger.mission_hash(manifest.mission.id) != digest:
-            payload = _base_projection(timestamp, 0, state="critical", post_gap=False)
+            payload = _base_projection(
+                timestamp, 0, state="critical", post_gap=False, activation=activation
+            )
             payload["incidents"] = [
                 _system_incident(
                     "manifest-binding-mismatch",
@@ -163,6 +185,7 @@ def run_tick(
             tick_seq,
             state="critical" if active_critical else ("degraded" if incidents else "ok"),
             post_gap=post_gap,
+            activation=activation,
         )
         payload["missions"] = [mission_state.to_dict(digest)]
         payload["incidents"] = incidents

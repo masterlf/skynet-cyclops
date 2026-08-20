@@ -8,12 +8,21 @@ import os
 import sys
 import time
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from enum import IntEnum
 from pathlib import Path
 
+from .activation import (
+    ActivationInputs,
+    ActivationVerdict,
+    activate_manager,
+    activation_verdict,
+    deactivate_manager,
+    load_activation_inputs,
+)
 from .adapter import HermesAdapter, ReadOnlyCollector
 from .bootstrap import apply_bootstrap, plan_bootstrap
-from .config import default_config_path, default_ledger_path, load_config
+from .config import Config, default_config_path, default_ledger_path, load_config
 from .errors import AdapterError, CyclopsError, LedgerError, ProjectionError, ValidationError
 from .ledger import Ledger
 from .manager import manager_router_gate, notification_courier
@@ -56,6 +65,17 @@ def _parser() -> argparse.ArgumentParser:
     router.add_argument("--config", default=str(default_config_path()))
     courier = manager_commands.add_parser("courier")
     courier.add_argument("--config", default=str(default_config_path()))
+    for command in (router, courier):
+        command.add_argument("--evidence")
+        command.add_argument("--hermes-home")
+    activate = manager_commands.add_parser("activate")
+    activate.add_argument("--config", default=str(default_config_path()))
+    activate.add_argument("--evidence", required=True)
+    activate.add_argument("--hermes-home", required=True)
+    activate.add_argument("--apply", action="store_true")
+    deactivate = manager_commands.add_parser("deactivate")
+    deactivate.add_argument("--config", default=str(default_config_path()))
+    deactivate.add_argument("--apply", action="store_true")
     install = manager_commands.add_parser("install")
     install.add_argument("--profile", default="default")
     install.add_argument("--home-delivery", required=True)
@@ -69,6 +89,22 @@ def _parser() -> argparse.ArgumentParser:
 
 def _json(value: object) -> None:
     print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+
+
+def _utc_now() -> str:
+    return datetime.now(UTC).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _activation_paths(
+    config: Config, evidence: str | None, hermes_home: str | None
+) -> tuple[Path, Path, Path]:
+    ledger_path = config.ledger_path
+    activation_path = ledger_path.parent / "manager-activation.json"
+    evidence_path = (
+        Path(evidence) if evidence else ledger_path.parent / "manager-current-evidence.json"
+    )
+    profile_home = Path(hermes_home) if hermes_home is not None else config.hermes_home
+    return activation_path, evidence_path, profile_home
 
 
 def _read_install_json(path: str | None, *, required: bool) -> object:
@@ -144,9 +180,60 @@ def _execute(args: argparse.Namespace) -> ExitCode:
             _json(spec)
             return ExitCode.OK
         config = load_config(args.config)
+        activation_path, evidence_path, profile_home = _activation_paths(
+            config,
+            getattr(args, "evidence", None),
+            getattr(args, "hermes_home", None),
+        )
+        if args.manager_command == "activate":
+
+            def collect_activation_inputs() -> ActivationInputs:
+                return load_activation_inputs(
+                    activation_path=activation_path,
+                    hermes_home=profile_home,
+                    evidence_path=evidence_path,
+                    hermes_binary=config.hermes_binary,
+                )
+
+            inputs = collect_activation_inputs()
+            _json(
+                activate_manager(
+                    inputs,
+                    now=_utc_now(),
+                    apply=args.apply,
+                    environment=os.environ,
+                    refresh=collect_activation_inputs,
+                )
+            )
+            return ExitCode.OK
+        if args.manager_command == "deactivate":
+            _json(
+                deactivate_manager(
+                    activation_path, now=_utc_now(), apply=args.apply, environment=os.environ
+                )
+            )
+            return ExitCode.OK
+
+        def current_activation() -> ActivationVerdict:
+            return activation_verdict(
+                load_activation_inputs(
+                    activation_path=activation_path,
+                    hermes_home=profile_home,
+                    evidence_path=evidence_path,
+                    hermes_binary=config.hermes_binary,
+                )
+            )
+
         with Ledger.open(config.ledger_path) as ledger:
             if args.manager_command == "router":
-                _json(manager_router_gate(ledger, now=time.time(), environment=os.environ))
+                _json(
+                    manager_router_gate(
+                        ledger,
+                        now=time.time(),
+                        environment=os.environ,
+                        activation_check=current_activation,
+                    )
+                )
             else:
                 output = notification_courier(ledger, now=time.time())
                 if output:
@@ -155,12 +242,21 @@ def _execute(args: argparse.Namespace) -> ExitCode:
     config = load_config(args.config)
     if args.command == "tick":
         manifest = load_manifest(config.manifest_path)
+        activation_path, evidence_path, profile_home = _activation_paths(config, None, None)
         payload = run_tick(
             manifest,
             config.ledger_path,
             config.status_path,
             ReadOnlyCollector(HermesAdapter(binary=config.hermes_binary)),
             debounce_ticks=config.incident_debounce_ticks,
+            activation_check=lambda: activation_verdict(
+                load_activation_inputs(
+                    activation_path=activation_path,
+                    hermes_home=profile_home,
+                    evidence_path=evidence_path,
+                    hermes_binary=config.hermes_binary,
+                )
+            ),
         )
         if args.json:
             _json(payload)
