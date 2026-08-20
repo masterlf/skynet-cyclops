@@ -12,6 +12,8 @@ import json
 import os
 import secrets
 import stat
+import subprocess  # Fixed argv, shell=False, sanitized child environment.  # nosec B404
+import sys
 import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -80,6 +82,30 @@ _VISIBLE_OPTIONAL = frozenset(
 
 CronTool = Callable[..., object]
 SeamVerifier = Callable[[], Mapping[str, object]]
+FullJobReader = Callable[[str], object]
+
+_SEAM_EVIDENCE_KEYS = frozenset(
+    {
+        "protocol",
+        "canonical_profile",
+        "configured_toolsets",
+        "cronjob_full_field_readback",
+        "courier_empty_is_silent",
+        "disposable_profile",
+        "non_task_scoped",
+        "quiet_agent_calls",
+        "resolved_tools",
+        "resolved_toolsets",
+    }
+)
+_VERIFIER_OUTPUT_LIMIT = 4096
+_VERIFIER_TIMEOUT_SECONDS = 60
+_VERIFIER_BOOTSTRAP = (
+    "import resource,runpy\n"
+    f"resource.setrlimit(resource.RLIMIT_FSIZE,({_VERIFIER_OUTPUT_LIMIT},"
+    f"{_VERIFIER_OUTPUT_LIMIT}))\n"
+    "runpy.run_module('skynet_cyclops.hermes_cron_seams',run_name='__main__')\n"
+)
 
 
 def _verification() -> dict[str, object]:
@@ -706,15 +732,14 @@ def _expected_readback(
     arguments: Mapping[str, object], job_id: str, *, state: str
 ) -> dict[str, object]:
     prompt = str(arguments["prompt"])
-    if len(prompt) > 100:
-        raise ValidationError("cron prompt cannot be exactly read back")
+    prompt_preview = prompt[:100] + "..." if len(prompt) > 100 else prompt
     return _security_readback(
         {
             "job_id": job_id,
             "name": arguments["name"],
             "skill": None,
             "skills": arguments["skills"],
-            "prompt_preview": prompt,
+            "prompt_preview": prompt_preview,
             "model": None,
             "provider": None,
             "base_url": None,
@@ -731,7 +756,41 @@ def _expected_readback(
     )
 
 
-def _readback_matches(tool: CronTool, expected: Mapping[str, Mapping[str, object]]) -> bool:
+def _full_prompt_matches(
+    reader: FullJobReader | None,
+    expected: Mapping[str, Mapping[str, object]],
+    prompts: Mapping[str, str],
+) -> bool:
+    if not expected:
+        return not prompts
+    if reader is None or set(prompts) != set(expected):
+        return False
+    for name, expected_job in expected.items():
+        job_id = expected_job.get("job_id")
+        if not isinstance(job_id, str):
+            return False
+        try:
+            result = reader(job_id)
+        except Exception:
+            return False
+        if not isinstance(result, Mapping):
+            return False
+        candidate = result.get("job", result)
+        if not isinstance(candidate, Mapping):
+            return False
+        candidate_id = candidate.get("id", candidate.get("job_id"))
+        if candidate_id != job_id or candidate.get("prompt") != prompts[name]:
+            return False
+    return True
+
+
+def _readback_matches(
+    tool: CronTool,
+    expected: Mapping[str, Mapping[str, object]],
+    *,
+    full_job_reader: FullJobReader | None = None,
+    expected_prompts: Mapping[str, str] | None = None,
+) -> bool:
     try:
         result = tool("list", include_disabled=True)
     except Exception:
@@ -747,27 +806,86 @@ def _readback_matches(tool: CronTool, expected: Mapping[str, Mapping[str, object
     if len(stable) != len(expected):
         return False
     by_name = {str(job["name"]): job for job in stable}
-    return set(by_name) == set(expected) and all(
+    visible_matches = set(by_name) == set(expected) and all(
         _security_readback(by_name[name]) == dict(expected_job)
         for name, expected_job in expected.items()
+    )
+    return visible_matches and _full_prompt_matches(
+        full_job_reader, expected, expected_prompts or {}
     )
 
 
 def _seam_evidence_is_valid(value: object) -> bool:
-    return isinstance(value, Mapping) and all(
-        (
-            value.get("protocol") == "cyclops-hermes-seam-evidence/v1",
-            value.get("canonical_profile") is True,
-            value.get("disposable_profile") is True,
-            value.get("configured_toolsets") == ["no_mcp"],
-            value.get("cronjob_full_field_readback") is True,
-            value.get("resolved_toolsets") == [],
-            value.get("resolved_tools") == [],
-            value.get("courier_empty_is_silent") is True,
-            value.get("non_task_scoped") is True,
-            value.get("quiet_agent_calls") == 0,
+    return (
+        isinstance(value, Mapping)
+        and set(value) == _SEAM_EVIDENCE_KEYS
+        and all(
+            (
+                value.get("protocol") == "cyclops-hermes-seam-evidence/v1",
+                value.get("canonical_profile") is True,
+                value.get("disposable_profile") is True,
+                value.get("configured_toolsets") == ["no_mcp"],
+                value.get("cronjob_full_field_readback") is True,
+                value.get("resolved_toolsets") == [],
+                value.get("resolved_tools") == [],
+                value.get("courier_empty_is_silent") is True,
+                value.get("non_task_scoped") is True,
+                type(value.get("quiet_agent_calls")) is int and value.get("quiet_agent_calls") == 0,
+            )
         )
     )
+
+
+def _run_hermes_seam_verifier() -> Mapping[str, object]:
+    """Execute the installed verifier in a private, sanitized child process."""
+    with tempfile.TemporaryDirectory(prefix="cyclops-hermes-verifier-") as temporary:
+        home = Path(temporary) / "home"
+        home.mkdir(mode=0o700)
+        hermes_home = home / ".hermes" / "profiles" / "default"
+        environment = {
+            "HOME": str(home),
+            "HERMES_HOME": str(hermes_home),
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PATH": os.defpath,
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONUTF8": "1",
+        }
+        stdout_path = Path(temporary) / "stdout"
+        stderr_path = Path(temporary) / "stderr"
+        with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+            completed = subprocess.run(  # noqa: S603 - fixed interpreter and bootstrap
+                [sys.executable, "-c", _VERIFIER_BOOTSTRAP],
+                shell=False,  # Static bounded argv; never a shell.  # nosec B603
+                check=False,
+                stdout=stdout,
+                stderr=stderr,
+                cwd=home,
+                env=environment,
+                timeout=_VERIFIER_TIMEOUT_SECONDS,
+            )
+        stdout_bytes = stdout_path.read_bytes()
+        stderr_bytes = stderr_path.read_bytes()
+        if (
+            completed.returncode != 0
+            or len(stdout_bytes) > _VERIFIER_OUTPUT_LIMIT
+            or len(stderr_bytes) > _VERIFIER_OUTPUT_LIMIT
+        ):
+            raise ValidationError("Hermes seam verifier failed")
+        try:
+            lines = stdout_bytes.decode("utf-8", errors="strict").splitlines()
+            stderr_bytes.decode("utf-8", errors="strict")
+        except UnicodeError as exc:
+            raise ValidationError("Hermes seam verifier output is invalid") from exc
+        if len(lines) != 1:
+            raise ValidationError("Hermes seam verifier output is invalid")
+        try:
+            report = json.loads(lines[0])
+        except (json.JSONDecodeError, UnicodeError) as exc:
+            raise ValidationError("Hermes seam verifier output is invalid") from exc
+        if not _seam_evidence_is_valid(report):
+            raise ValidationError("Hermes seam verifier evidence is invalid")
+        return cast(Mapping[str, object], report)
 
 
 def execute_cron_install_spec(
@@ -775,6 +893,7 @@ def execute_cron_install_spec(
     tool: CronTool,
     *,
     seam_verifier: SeamVerifier | None = None,
+    full_job_reader: FullJobReader | None = None,
 ) -> dict[str, object]:
     """Reference fail-closed interpreter for the emitted supported-tool operations."""
     validated_spec = _validate_cron_install_spec(dict(spec))
@@ -787,6 +906,15 @@ def execute_cron_install_spec(
         for job in snapshot
         if job["name"] in _STABLE_NAMES
     }
+    expected_prompts: dict[str, str] = {}
+    if operation == "upgrade":
+        for item in rollback:
+            arguments = cast(dict[str, object], item["arguments"])
+            expected_prompts[str(item["stable_name"])] = str(arguments["prompt"])
+    if full_job_reader is None:
+        candidate_reader = getattr(tool, "read_full_job", None)
+        if callable(candidate_reader):
+            full_job_reader = cast(FullJobReader, candidate_reader)
     created: dict[int, str] = {}
     failed = False
     for index, item in enumerate(operations):
@@ -816,7 +944,13 @@ def execute_cron_install_spec(
             expected[str(item["stable_name"])] = _expected_readback(
                 arguments, job_id, state="scheduled"
             )
-            if not _readback_matches(tool, expected):
+            expected_prompts[str(item["stable_name"])] = str(arguments["prompt"])
+            if not _readback_matches(
+                tool,
+                expected,
+                full_job_reader=full_job_reader,
+                expected_prompts=expected_prompts,
+            ):
                 failed = True
                 break
             if item.get("pause_after_create") is True:
@@ -831,7 +965,12 @@ def execute_cron_install_spec(
                 expected[str(item["stable_name"])] = _expected_readback(
                     arguments, job_id, state="paused"
                 )
-                if not _readback_matches(tool, expected):
+                if not _readback_matches(
+                    tool,
+                    expected,
+                    full_job_reader=full_job_reader,
+                    expected_prompts=expected_prompts,
+                ):
                     failed = True
                     break
         else:
@@ -839,15 +978,19 @@ def execute_cron_install_spec(
             expected[str(item["stable_name"])] = _expected_readback(
                 arguments, job_id, state="paused"
             )
-            if not _readback_matches(tool, expected):
+            expected_prompts[str(item["stable_name"])] = str(arguments["prompt"])
+            if not _readback_matches(
+                tool,
+                expected,
+                full_job_reader=full_job_reader,
+                expected_prompts=expected_prompts,
+            ):
                 failed = True
                 break
     if not failed:
         verifier = seam_verifier
         if verifier is None:
-            from .hermes_cron_seams import verify_hermes_cron_seams
-
-            verifier = verify_hermes_cron_seams
+            verifier = _run_hermes_seam_verifier
         try:
             failed = not _seam_evidence_is_valid(verifier())
         except Exception:
@@ -881,7 +1024,17 @@ def execute_cron_install_spec(
         for job in snapshot
         if job["name"] in _STABLE_NAMES
     }
-    if not _readback_matches(tool, rollback_expected):
+    rollback_prompts: dict[str, str] = {}
+    if operation == "upgrade":
+        for item in rollback:
+            arguments = cast(dict[str, object], item["arguments"])
+            rollback_prompts[str(item["stable_name"])] = str(arguments["prompt"])
+    if not _readback_matches(
+        tool,
+        rollback_expected,
+        full_job_reader=full_job_reader,
+        expected_prompts=rollback_prompts,
+    ):
         rollback_failures.append("readback")
     return {
         "state": "rollback_failed" if rollback_failures else "rolled_back",

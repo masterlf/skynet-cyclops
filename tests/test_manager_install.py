@@ -3,6 +3,10 @@ from __future__ import annotations
 import json
 import os
 import stat
+import subprocess
+import threading
+import time
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -22,12 +26,13 @@ NONCE = "7" * 64
 
 def visible_job(name: str, job_id: str) -> dict[str, object]:
     courier = name == "cyclops-decision-courier"
+    prompt = "" if courier else MANAGER_PROMPT
     return {
         "job_id": job_id,
         "name": name,
         "skill": None,
         "skills": [],
-        "prompt_preview": "" if courier else MANAGER_PROMPT,
+        "prompt_preview": prompt[:100] + "..." if len(prompt) > 100 else prompt,
         "model": None,
         "provider": None,
         "base_url": None,
@@ -113,6 +118,10 @@ class FakeCronTool:
         self.fail_action = fail_action
         self.fail_occurrence = fail_occurrence
         self.pause_state = pause_state
+        self.full_prompts = {
+            str(job["job_id"]): "" if job["name"] == "cyclops-decision-courier" else MANAGER_PROMPT
+            for job in jobs or []
+        }
 
     def __call__(self, action: str, **arguments: Any) -> dict[str, object]:
         self.calls.append((action, arguments.get("job_id")))
@@ -123,6 +132,7 @@ class FakeCronTool:
             self.created += 1
             job_id = f"created-{self.created}"
             self.jobs[job_id] = rendered_job(arguments, job_id, state="scheduled")
+            self.full_prompts[job_id] = str(arguments["prompt"])
             return {"success": True, "job_id": job_id}
         if action == "pause":
             job = self.jobs[str(arguments["job_id"])]
@@ -137,13 +147,21 @@ class FakeCronTool:
         if action == "update":
             job_id = str(arguments["job_id"])
             self.jobs[job_id] = rendered_job(arguments, job_id)
+            self.full_prompts[job_id] = str(arguments["prompt"])
             return {"success": True, "job": self.jobs[job_id]}
         if action == "remove":
-            self.jobs.pop(str(arguments["job_id"]), None)
+            job_id = str(arguments["job_id"])
+            self.jobs.pop(job_id, None)
+            self.full_prompts.pop(job_id, None)
             return {"success": True}
         if action == "list":
             return {"success": True, "jobs": list(self.jobs.values())}
         raise AssertionError(action)
+
+    def read_full_job(self, job_id: str) -> dict[str, object] | None:
+        if job_id not in self.full_prompts:
+            return None
+        return {"id": job_id, "prompt": self.full_prompts[job_id]}
 
 
 def test_initial_spec_refuses_any_stable_name_conflict() -> None:
@@ -517,6 +535,7 @@ def test_executor_rolls_back_wrong_full_field_readback_and_failed_seam() -> None
         attempt_nonce=NONCE,
     )
     jobs: dict[str, dict[str, object]] = {}
+    full_prompts: dict[str, str] = {}
     created = 0
 
     def tool(action: str, **arguments: Any) -> dict[str, object]:
@@ -525,6 +544,7 @@ def test_executor_rolls_back_wrong_full_field_readback_and_failed_seam() -> None
             created += 1
             job_id = f"job-{created}"
             jobs[job_id] = rendered_job(arguments, job_id, state="scheduled")
+            full_prompts[job_id] = str(arguments["prompt"])
             return {"success": True, "job_id": job_id}
         if action == "pause":
             jobs[str(arguments["job_id"])].update(
@@ -537,11 +557,23 @@ def test_executor_rolls_back_wrong_full_field_readback_and_failed_seam() -> None
         if action == "list":
             return {"success": True, "jobs": list(jobs.values())}
         if action == "remove":
-            jobs.pop(str(arguments["job_id"]), None)
+            job_id = str(arguments["job_id"])
+            jobs.pop(job_id, None)
+            full_prompts.pop(job_id, None)
             return {"success": True}
         raise AssertionError(action)
 
-    report = execute_cron_install_spec(spec, tool, seam_verifier=valid_seam_evidence)
+    def read_full_job(job_id: str) -> dict[str, object] | None:
+        if job_id not in full_prompts:
+            return None
+        return {"id": job_id, "prompt": full_prompts[job_id]}
+
+    report = execute_cron_install_spec(
+        spec,
+        tool,
+        seam_verifier=valid_seam_evidence,
+        full_job_reader=read_full_job,
+    )
     assert report["state"] == "applied_paused"
     assert len(jobs) == 2
 
@@ -554,13 +586,20 @@ def test_executor_rolls_back_wrong_full_field_readback_and_failed_seam() -> None
 
     jobs.clear()
     created = 0
-    report = execute_cron_install_spec(spec, wrong_prompt_tool, seam_verifier=valid_seam_evidence)
+    report = execute_cron_install_spec(
+        spec,
+        wrong_prompt_tool,
+        seam_verifier=valid_seam_evidence,
+        full_job_reader=read_full_job,
+    )
     assert report["state"] == "rolled_back"
     assert jobs == {}
 
     jobs.clear()
     created = 0
-    report = execute_cron_install_spec(spec, tool, seam_verifier=lambda: {})
+    report = execute_cron_install_spec(
+        spec, tool, seam_verifier=lambda: {}, full_job_reader=read_full_job
+    )
     assert report["state"] == "rolled_back"
     assert jobs == {}
 
@@ -578,7 +617,12 @@ def test_executor_consumes_supported_cronjob_json_results() -> None:
     def json_tool(action: str, **arguments: Any) -> str:
         return json.dumps(stateful(action, **arguments))
 
-    report = execute_cron_install_spec(spec, json_tool, seam_verifier=valid_seam_evidence)
+    report = execute_cron_install_spec(
+        spec,
+        json_tool,
+        seam_verifier=valid_seam_evidence,
+        full_job_reader=stateful.read_full_job,
+    )
     assert report["state"] == "applied_paused"
 
 
@@ -594,8 +638,9 @@ def test_tool_result_and_verification_boundaries_fail_closed() -> None:
     incomplete = valid_seam_evidence()
     incomplete.pop("cronjob_full_field_readback")
     assert not manager_install._seam_evidence_is_valid(incomplete)
-    with pytest.raises(ValidationError, match="exactly read back"):
-        manager_install._expected_readback({"prompt": "x" * 101}, "synthetic-job", state="paused")
+    extra = valid_seam_evidence()
+    extra["unexpected"] = True
+    assert not manager_install._seam_evidence_is_valid(extra)
 
 
 @pytest.mark.parametrize(
@@ -1043,3 +1088,143 @@ def test_executor_rolls_back_after_tool_exception_or_unverified_pause() -> None:
     pause_not_verified = FakeCronTool(pause_state="scheduled")
     report = execute_cron_install_spec(spec, pause_not_verified)
     assert report["state"] == "rolled_back"
+
+
+def test_executor_requires_non_truncated_prompt_readback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = build_cron_install_spec(
+        profile="default",
+        home_delivery="telegram",
+        operation="install",
+        visible_jobs=[],
+        attempt_nonce=NONCE,
+    )
+    monkeypatch.setattr(
+        manager_install,
+        "_run_hermes_seam_verifier",
+        lambda: valid_seam_evidence(),
+        raising=False,
+    )
+    tool = FakeCronTool()
+    report = execute_cron_install_spec(spec, tool, full_job_reader=tool.read_full_job)
+    assert report["state"] == "applied_paused"
+
+    tampered = FakeCronTool()
+
+    def truncated_reader(job_id: str) -> dict[str, object] | None:
+        job = tampered.read_full_job(job_id)
+        if job is not None and job["prompt"] == MANAGER_PROMPT:
+            job["prompt"] = MANAGER_PROMPT[:100]
+        return job
+
+    report = execute_cron_install_spec(spec, tampered, full_job_reader=truncated_reader)
+    assert report["state"] == "rolled_back"
+    assert tampered.jobs == {}
+
+
+def test_seam_verifier_subprocess_has_private_minimal_environment_and_no_parent_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent_before = dict(os.environ)
+    os.environ.update(
+        {
+            "HERMES_HOME": str(tmp_path / "live-profile"),
+            "HERMES_KANBAN_TASK": "synthetic-task",
+            "HERMES_DELEGATION_PARENT": "synthetic-parent",
+            "UNRELATED_SECRET": "must-not-be-inherited",
+        }
+    )
+    expected_parent = dict(os.environ)
+    context_home: ContextVar[str] = ContextVar("hermes_home_override")
+    override_token = context_home.set(str(tmp_path / "context-profile"))
+    live_sentinel = tmp_path / "live-profile" / "sentinel"
+    live_sentinel.parent.mkdir()
+    live_sentinel.write_text("unchanged", encoding="utf-8")
+    observed: list[dict[str, str]] = []
+    stop = threading.Event()
+
+    def observe_parent() -> None:
+        while not stop.is_set():
+            observed.append(dict(os.environ))
+            time.sleep(0.001)
+
+    thread = threading.Thread(target=observe_parent)
+    thread.start()
+
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        environment = kwargs["env"]
+        assert isinstance(environment, dict)
+        assert set(environment) == {
+            "HOME",
+            "HERMES_HOME",
+            "LANG",
+            "LC_ALL",
+            "PATH",
+            "PYTHONNOUSERSITE",
+            "PYTHONUTF8",
+        }
+        assert environment["HOME"] != os.environ["HOME"]
+        assert Path(environment["HERMES_HOME"]).is_relative_to(Path(environment["HOME"]))
+        assert kwargs["timeout"] == 60
+        assert kwargs["shell"] is False
+        assert str(kwargs["cwd"]) == environment["HOME"]
+        assert "capture_output" not in kwargs
+        stdout: Any = kwargs["stdout"]
+        assert hasattr(stdout, "write")
+        stdout.write(json.dumps(valid_seam_evidence()).encode() + b"\n")
+        stdout.flush()
+        time.sleep(0.02)
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout=None,
+            stderr=None,
+        )
+
+    monkeypatch.setattr(manager_install.subprocess, "run", fake_run, raising=False)
+    try:
+        assert manager_install._run_hermes_seam_verifier() == valid_seam_evidence()
+    finally:
+        stop.set()
+        thread.join()
+        context_home.reset(override_token)
+        os.environ.clear()
+        os.environ.update(parent_before)
+    assert observed
+    assert all(snapshot == expected_parent for snapshot in observed)
+    assert live_sentinel.read_text(encoding="utf-8") == "unchanged"
+
+
+@pytest.mark.parametrize(
+    ("stdout_bytes", "stderr_bytes", "returncode", "message"),
+    [
+        (b"not-json\n", b"", 0, "output is invalid"),
+        (b"{}\n", b"", 0, "evidence is invalid"),
+        (b"{}\n{}\n", b"", 0, "output is invalid"),
+        (b"\xff\n", b"", 0, "output is invalid"),
+        (b"x" * 4097, b"", 0, "verifier failed"),
+        (b"", b"x" * 4097, 0, "verifier failed"),
+        (b"", b"", 1, "verifier failed"),
+    ],
+)
+def test_seam_verifier_rejects_unbounded_or_noncanonical_child_output(
+    stdout_bytes: bytes,
+    stderr_bytes: bytes,
+    returncode: int,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        command: Any = args[0]
+        stdout: Any = kwargs["stdout"]
+        stderr: Any = kwargs["stderr"]
+        stdout.write(stdout_bytes)
+        stderr.write(stderr_bytes)
+        stdout.flush()
+        stderr.flush()
+        return subprocess.CompletedProcess(args=command, returncode=returncode)
+
+    monkeypatch.setattr(manager_install.subprocess, "run", fake_run)
+    with pytest.raises(ValidationError, match=message):
+        manager_install._run_hermes_seam_verifier()
