@@ -79,11 +79,14 @@ _VISIBLE_OPTIONAL = frozenset(
 )
 
 CronTool = Callable[..., object]
+SeamVerifier = Callable[[], Mapping[str, object]]
 
 
 def _verification() -> dict[str, object]:
     return {
         "hermes_seam_evidence_protocol": "cyclops-hermes-seam-evidence/v1",
+        "disposable_profile": True,
+        "cronjob_full_field_readback": True,
         "jobs_paused": True,
         "stable_names_exactly_once": True,
         "resolved_toolsets": {"cyclops-manager-router": []},
@@ -382,6 +385,7 @@ def _validate_cron_install_spec(value: object) -> dict[str, object]:
         if not isinstance(courier_arguments, dict):
             raise ValidationError("cron install execution spec is invalid")
         current_arguments = _job_arguments(_home_delivery(courier_arguments.get("deliver")))
+        expected_rollback: list[dict[str, object]]
 
         if operation == "install":
             expected_operations = [
@@ -634,23 +638,155 @@ def stage_cron_install(spec: Mapping[str, object], hermes_home: Path) -> dict[st
     }
 
 
+def _tool_mapping(result: object) -> Mapping[str, object] | None:
+    if isinstance(result, Mapping):
+        return result
+    if not isinstance(result, str) or len(result.encode()) > 1_000_000:
+        return None
+    try:
+        parsed = json.loads(result)
+    except (json.JSONDecodeError, UnicodeError):
+        return None
+    return parsed if isinstance(parsed, Mapping) else None
+
+
 def _tool_success(result: object) -> bool:
-    return isinstance(result, Mapping) and result.get("success") is True
+    parsed = _tool_mapping(result)
+    return parsed is not None and parsed.get("success") is True
 
 
 def _tool_job_is_paused(result: object) -> bool:
-    if not isinstance(result, Mapping):
+    parsed = _tool_mapping(result)
+    if parsed is None:
         return False
-    job = result.get("job")
+    job = parsed.get("job")
     return isinstance(job, Mapping) and job.get("state") == "paused" and job.get("enabled") is False
 
 
-def execute_cron_install_spec(spec: Mapping[str, object], tool: CronTool) -> dict[str, object]:
+_SECURITY_READBACK_FIELDS = (
+    "job_id",
+    "name",
+    "skill",
+    "skills",
+    "prompt_preview",
+    "model",
+    "provider",
+    "base_url",
+    "schedule",
+    "repeat",
+    "deliver",
+    "enabled",
+    "state",
+    "script",
+    "monitor_script",
+    "monitor_url",
+    "no_agent",
+    "enabled_toolsets",
+    "workdir",
+    "continuity",
+    "context_from",
+)
+
+
+def _security_readback(job: Mapping[str, object]) -> dict[str, object]:
+    defaults: dict[str, object] = {
+        "script": None,
+        "monitor_script": None,
+        "monitor_url": None,
+        "no_agent": False,
+        "enabled_toolsets": [],
+        "workdir": None,
+        "continuity": False,
+        "context_from": [],
+    }
+    return {key: job.get(key, defaults.get(key)) for key in _SECURITY_READBACK_FIELDS}
+
+
+def _expected_readback(
+    arguments: Mapping[str, object], job_id: str, *, state: str
+) -> dict[str, object]:
+    prompt = str(arguments["prompt"])
+    if len(prompt) > 100:
+        raise ValidationError("cron prompt cannot be exactly read back")
+    return _security_readback(
+        {
+            "job_id": job_id,
+            "name": arguments["name"],
+            "skill": None,
+            "skills": arguments["skills"],
+            "prompt_preview": prompt,
+            "model": None,
+            "provider": None,
+            "base_url": None,
+            "schedule": arguments["schedule"],
+            "repeat": "forever",
+            "deliver": arguments["deliver"],
+            "enabled": state != "paused",
+            "state": state,
+            "script": arguments["script"],
+            "no_agent": arguments["no_agent"],
+            "enabled_toolsets": arguments["enabled_toolsets"],
+            "continuity": arguments["continuity"],
+        }
+    )
+
+
+def _readback_matches(tool: CronTool, expected: Mapping[str, Mapping[str, object]]) -> bool:
+    try:
+        result = tool("list", include_disabled=True)
+    except Exception:
+        return False
+    parsed = _tool_mapping(result)
+    if not _tool_success(result) or parsed is None:
+        return False
+    try:
+        jobs = _validate_visible_jobs(parsed.get("jobs"))
+    except ValidationError:
+        return False
+    stable = [job for job in jobs if job["name"] in _STABLE_NAMES]
+    if len(stable) != len(expected):
+        return False
+    by_name = {str(job["name"]): job for job in stable}
+    return set(by_name) == set(expected) and all(
+        _security_readback(by_name[name]) == dict(expected_job)
+        for name, expected_job in expected.items()
+    )
+
+
+def _seam_evidence_is_valid(value: object) -> bool:
+    return isinstance(value, Mapping) and all(
+        (
+            value.get("protocol") == "cyclops-hermes-seam-evidence/v1",
+            value.get("canonical_profile") is True,
+            value.get("disposable_profile") is True,
+            value.get("configured_toolsets") == ["no_mcp"],
+            value.get("cronjob_full_field_readback") is True,
+            value.get("resolved_toolsets") == [],
+            value.get("resolved_tools") == [],
+            value.get("courier_empty_is_silent") is True,
+            value.get("non_task_scoped") is True,
+            value.get("quiet_agent_calls") == 0,
+        )
+    )
+
+
+def execute_cron_install_spec(
+    spec: Mapping[str, object],
+    tool: CronTool,
+    *,
+    seam_verifier: SeamVerifier | None = None,
+) -> dict[str, object]:
     """Reference fail-closed interpreter for the emitted supported-tool operations."""
     validated_spec = _validate_cron_install_spec(dict(spec))
     operation = validated_spec["operation"]
     operations = cast(list[dict[str, object]], validated_spec["operations"])
     rollback = cast(list[dict[str, object]], validated_spec["rollback"])
+    snapshot = cast(list[dict[str, object]], validated_spec["snapshot"])
+    expected: dict[str, dict[str, object]] = {
+        str(job["name"]): _security_readback(job)
+        for job in snapshot
+        if job["name"] in _STABLE_NAMES
+    }
     created: dict[int, str] = {}
     failed = False
     for index, item in enumerate(operations):
@@ -668,14 +804,21 @@ def execute_cron_install_spec(spec: Mapping[str, object], tool: CronTool) -> dic
             failed = True
             break
         if action == "create":
-            if not isinstance(result, Mapping):
+            parsed = _tool_mapping(result)
+            if parsed is None:
                 failed = True
                 break
-            job_id = result.get("job_id")
+            job_id = parsed.get("job_id")
             if not isinstance(job_id, str) or not job_id:
                 failed = True
                 break
             created[index] = job_id
+            expected[str(item["stable_name"])] = _expected_readback(
+                arguments, job_id, state="scheduled"
+            )
+            if not _readback_matches(tool, expected):
+                failed = True
+                break
             if item.get("pause_after_create") is True:
                 try:
                     pause = tool("pause", job_id=job_id, reason="cyclops-install")
@@ -685,6 +828,30 @@ def execute_cron_install_spec(spec: Mapping[str, object], tool: CronTool) -> dic
                 if not _tool_success(pause) or not _tool_job_is_paused(pause):
                     failed = True
                     break
+                expected[str(item["stable_name"])] = _expected_readback(
+                    arguments, job_id, state="paused"
+                )
+                if not _readback_matches(tool, expected):
+                    failed = True
+                    break
+        else:
+            job_id = cast(str, item["job_id"])
+            expected[str(item["stable_name"])] = _expected_readback(
+                arguments, job_id, state="paused"
+            )
+            if not _readback_matches(tool, expected):
+                failed = True
+                break
+    if not failed:
+        verifier = seam_verifier
+        if verifier is None:
+            from .hermes_cron_seams import verify_hermes_cron_seams
+
+            verifier = verify_hermes_cron_seams
+        try:
+            failed = not _seam_evidence_is_valid(verifier())
+        except Exception:
+            failed = True
     if not failed:
         return {
             "state": "applied_paused",
@@ -709,6 +876,13 @@ def execute_cron_install_spec(spec: Mapping[str, object], tool: CronTool) -> dic
             continue
         if not _tool_success(result) or (action == "update" and not _tool_job_is_paused(result)):
             rollback_failures.append(str(item.get("stable_name", "unknown")))
+    rollback_expected = {
+        str(job["name"]): _security_readback(job)
+        for job in snapshot
+        if job["name"] in _STABLE_NAMES
+    }
+    if not _readback_matches(tool, rollback_expected):
+        rollback_failures.append("readback")
     return {
         "state": "rollback_failed" if rollback_failures else "rolled_back",
         "operation": operation,

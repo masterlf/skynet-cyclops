@@ -59,16 +59,21 @@ cyclops manager install --profile default --home-delivery telegram --apply \
   --snapshot /private/path/cron-jobs.json --hermes-home /private/default-profile-home
 ```
 
-The profile-local agent consumes only the emitted `cyclops-cron-install/v1` operations. Each create
-is immediately paused and verified; any later failure removes only job IDs returned by this
-attempt. Upgrades use `--operation upgrade --previous-spec /private/path/manager-install.json`,
+The profile-local agent consumes only the emitted `cyclops-cron-install/v1` operations. After each
+create, update, and pause it calls `cronjob(action="list", include_disabled=true)` and compares every
+tool-visible security field with the snapshot-bound expected definition. Each create is immediately
+paused and verified; any mismatch or later failure triggers reverse rollback followed by another
+full-field readback. Upgrades use `--operation upgrade --previous-spec /private/path/manager-install.json`,
 require exactly one paused full-field tool snapshot per stable name, and restore through
 `cronjob.update` in reverse order. A conflict or ambiguous/missing snapshot fails before mutation.
 
-Run `scripts/verify_hermes_cron_seams.py` in a disposable `default` profile before activation. Its
+Run the wheel-installed `cyclops-verify-hermes-cron-seams` command before activation (the repository
+wrapper `scripts/verify_hermes_cron_seams.py` is equivalent). The verifier always creates and removes
+its own synthetic temporary `default` profile; it does not accept or mutate a configured profile. Its
 `cyclops-hermes-seam-evidence/v1` output behaviorally verifies that configured
 `enabled_toolsets=["no_mcp"]` resolves to zero tools under non-dispatcher cron context and that an
-empty no-agent courier run is silent with zero agent construction. This is partial seam evidence;
+empty no-agent courier run is silent with zero agent construction, and a synthetic create/pause/list/
+remove cycle exposes exact full-field cronjob readback. This is partial seam evidence;
 the profile-local installer must still verify stable paused identity, local delivery, and bounded
 exactly-one output matching before activation. Never substitute a literal stored
 `enabled_toolsets=[]` for the manager job.

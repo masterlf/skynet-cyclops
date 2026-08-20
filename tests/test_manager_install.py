@@ -10,6 +10,7 @@ import pytest
 
 import skynet_cyclops.manager_install as manager_install
 from skynet_cyclops.errors import ValidationError
+from skynet_cyclops.manager import MANAGER_PROMPT
 from skynet_cyclops.manager_install import (
     build_cron_install_spec,
     execute_cron_install_spec,
@@ -20,18 +21,19 @@ NONCE = "7" * 64
 
 
 def visible_job(name: str, job_id: str) -> dict[str, object]:
+    courier = name == "cyclops-decision-courier"
     return {
         "job_id": job_id,
         "name": name,
         "skill": None,
         "skills": [],
-        "prompt_preview": "Cyclops managed job",
+        "prompt_preview": "" if courier else MANAGER_PROMPT,
         "model": None,
         "provider": None,
         "base_url": None,
         "schedule": "every 2m",
         "repeat": "forever",
-        "deliver": "local",
+        "deliver": "telegram" if courier else "local",
         "next_run_at": "2026-08-20T00:00:00Z",
         "last_run_at": None,
         "last_status": None,
@@ -41,9 +43,107 @@ def visible_job(name: str, job_id: str) -> dict[str, object]:
         "state": "paused",
         "paused_at": "2026-08-19T00:00:00Z",
         "paused_reason": "cyclops-install",
-        "script": "cyclops-manager-router.py",
-        "enabled_toolsets": ["no_mcp"],
+        "script": "cyclops-decision-courier.py" if courier else "cyclops-manager-router.py",
+        **({"no_agent": True} if courier else {"enabled_toolsets": ["no_mcp"]}),
     }
+
+
+def rendered_job(
+    arguments: dict[str, object], job_id: str, *, state: str = "paused"
+) -> dict[str, object]:
+    prompt = str(arguments["prompt"])
+    result: dict[str, object] = {
+        "job_id": job_id,
+        "name": arguments["name"],
+        "skill": None,
+        "skills": arguments["skills"],
+        "prompt_preview": prompt[:100] + "..." if len(prompt) > 100 else prompt,
+        "model": None,
+        "provider": None,
+        "base_url": None,
+        "schedule": arguments["schedule"],
+        "repeat": "forever",
+        "deliver": arguments["deliver"],
+        "next_run_at": "synthetic-next",
+        "last_run_at": None,
+        "last_status": None,
+        "last_delivery_error": None,
+        "last_fire_error": None,
+        "enabled": state != "paused",
+        "state": state,
+        "paused_at": "synthetic-paused" if state == "paused" else None,
+        "paused_reason": "cyclops-install" if state == "paused" else None,
+        "script": arguments["script"],
+    }
+    if arguments["no_agent"] is True:
+        result["no_agent"] = True
+    if arguments["enabled_toolsets"]:
+        result["enabled_toolsets"] = arguments["enabled_toolsets"]
+    return result
+
+
+def valid_seam_evidence() -> dict[str, object]:
+    return {
+        "protocol": "cyclops-hermes-seam-evidence/v1",
+        "canonical_profile": True,
+        "configured_toolsets": ["no_mcp"],
+        "cronjob_full_field_readback": True,
+        "courier_empty_is_silent": True,
+        "disposable_profile": True,
+        "non_task_scoped": True,
+        "quiet_agent_calls": 0,
+        "resolved_tools": [],
+        "resolved_toolsets": [],
+    }
+
+
+class FakeCronTool:
+    def __init__(
+        self,
+        jobs: list[dict[str, object]] | None = None,
+        *,
+        fail_action: str | None = None,
+        fail_occurrence: int = 1,
+        pause_state: str = "paused",
+    ) -> None:
+        self.jobs = {str(job["job_id"]): dict(job) for job in jobs or []}
+        self.calls: list[tuple[str, str | None]] = []
+        self.counts: dict[str, int] = {}
+        self.created = 0
+        self.fail_action = fail_action
+        self.fail_occurrence = fail_occurrence
+        self.pause_state = pause_state
+
+    def __call__(self, action: str, **arguments: Any) -> dict[str, object]:
+        self.calls.append((action, arguments.get("job_id")))
+        self.counts[action] = self.counts.get(action, 0) + 1
+        if action == self.fail_action and self.counts[action] == self.fail_occurrence:
+            return {"success": False, "error": "synthetic failure"}
+        if action == "create":
+            self.created += 1
+            job_id = f"created-{self.created}"
+            self.jobs[job_id] = rendered_job(arguments, job_id, state="scheduled")
+            return {"success": True, "job_id": job_id}
+        if action == "pause":
+            job = self.jobs[str(arguments["job_id"])]
+            paused = self.pause_state == "paused"
+            job.update(
+                state=self.pause_state,
+                enabled=not paused,
+                paused_at="synthetic-paused" if paused else None,
+                paused_reason="cyclops-install" if paused else None,
+            )
+            return {"success": True, "job": job}
+        if action == "update":
+            job_id = str(arguments["job_id"])
+            self.jobs[job_id] = rendered_job(arguments, job_id)
+            return {"success": True, "job": self.jobs[job_id]}
+        if action == "remove":
+            self.jobs.pop(str(arguments["job_id"]), None)
+            return {"success": True}
+        if action == "list":
+            return {"success": True, "jobs": list(self.jobs.values())}
+        raise AssertionError(action)
 
 
 def test_initial_spec_refuses_any_stable_name_conflict() -> None:
@@ -161,27 +261,19 @@ def test_executor_removes_only_created_jobs_after_partial_install_failure() -> N
         visible_jobs=[],
         attempt_nonce=NONCE,
     )
-    calls: list[tuple[str, str | None]] = []
-
-    def tool(action: str, **arguments: Any) -> dict[str, object]:
-        calls.append((action, arguments.get("job_id")))
-        if action == "create" and len([item for item in calls if item[0] == "create"]) == 1:
-            return {"success": True, "job_id": "new-router", "job": {"state": "paused"}}
-        if action == "remove":
-            return {"success": True}
-        return {"success": False, "error": "synthetic failure"}
-
+    tool = FakeCronTool(fail_action="create", fail_occurrence=2)
     report = execute_cron_install_spec(spec, tool)
     assert report == {
         "state": "rolled_back",
         "operation": "install",
-        "created_job_ids": ["new-router"],
+        "created_job_ids": ["created-1"],
         "rollback_failures": [],
     }
-    assert calls == [
+    assert [call for call in tool.calls if call[0] != "list"] == [
         ("create", None),
-        ("pause", "new-router"),
-        ("remove", "new-router"),
+        ("pause", "created-1"),
+        ("create", None),
+        ("remove", "created-1"),
     ]
 
 
@@ -204,21 +296,17 @@ def test_executor_restores_upgrade_with_update_until_converged() -> None:
         previous_spec=installed,
         attempt_nonce=NONCE,
     )
-    updates = 0
-    calls: list[tuple[str, str | None]] = []
-
-    def tool(action: str, **arguments: Any) -> dict[str, object]:
-        nonlocal updates
-        calls.append((action, arguments.get("job_id")))
-        if action == "update":
-            updates += 1
-            if updates == 2:
-                return {"success": False, "error": "synthetic failure"}
-        return {"success": True, "job": {"state": "paused", "enabled": False}}
-
+    tool = FakeCronTool(
+        [
+            visible_job("cyclops-manager-router", "job-router"),
+            visible_job("cyclops-decision-courier", "job-courier"),
+        ],
+        fail_action="update",
+        fail_occurrence=2,
+    )
     report = execute_cron_install_spec(spec, tool)
     assert report["state"] == "rolled_back"
-    assert calls == [
+    assert [call for call in tool.calls if call[0] != "list"] == [
         ("update", "job-router"),
         ("update", "job-courier"),
         ("update", "job-courier"),
@@ -399,32 +487,115 @@ def test_executor_success_and_failed_rollback_are_explicit() -> None:
         visible_jobs=[],
         attempt_nonce=NONCE,
     )
-    created = 0
-
-    def success_tool(action: str, **_arguments: Any) -> dict[str, object]:
-        nonlocal created
-        if action == "create":
-            created += 1
-            return {"success": True, "job_id": f"job-{created}"}
-        if action == "pause":
-            return {"success": True, "job": {"state": "paused", "enabled": False}}
-        return {"success": True}
-
-    assert execute_cron_install_spec(spec, success_tool) == {
+    success_tool = FakeCronTool()
+    assert execute_cron_install_spec(spec, success_tool, seam_verifier=valid_seam_evidence) == {
         "state": "applied_paused",
         "operation": "install",
-        "created_job_ids": ["job-1", "job-2"],
+        "created_job_ids": ["created-1", "created-2"],
         "rollback_failures": [],
     }
+    assert success_tool.counts["list"] == 4
 
     def failed_tool(action: str, **_arguments: Any) -> dict[str, object]:
         if action == "create":
             return {"success": True}
+        if action == "list":
+            return {"success": True, "jobs": []}
         return {"success": False}
 
     report = execute_cron_install_spec(spec, failed_tool)
     assert report["state"] == "rolled_back"
     assert report["created_job_ids"] == []
+
+
+def test_executor_rolls_back_wrong_full_field_readback_and_failed_seam() -> None:
+    spec = build_cron_install_spec(
+        profile="default",
+        home_delivery="telegram",
+        operation="install",
+        visible_jobs=[],
+        attempt_nonce=NONCE,
+    )
+    jobs: dict[str, dict[str, object]] = {}
+    created = 0
+
+    def tool(action: str, **arguments: Any) -> dict[str, object]:
+        nonlocal created
+        if action == "create":
+            created += 1
+            job_id = f"job-{created}"
+            jobs[job_id] = rendered_job(arguments, job_id, state="scheduled")
+            return {"success": True, "job_id": job_id}
+        if action == "pause":
+            jobs[str(arguments["job_id"])].update(
+                state="paused",
+                enabled=False,
+                paused_at="synthetic-paused",
+                paused_reason="cyclops-install",
+            )
+            return {"success": True, "job": jobs[str(arguments["job_id"])]}
+        if action == "list":
+            return {"success": True, "jobs": list(jobs.values())}
+        if action == "remove":
+            jobs.pop(str(arguments["job_id"]), None)
+            return {"success": True}
+        raise AssertionError(action)
+
+    report = execute_cron_install_spec(spec, tool, seam_verifier=valid_seam_evidence)
+    assert report["state"] == "applied_paused"
+    assert len(jobs) == 2
+
+    def wrong_prompt_tool(action: str, **arguments: Any) -> dict[str, object]:
+        result = tool(action, **arguments)
+        if action == "list" and jobs:
+            first = next(iter(jobs.values()))
+            first["prompt_preview"] = "wrong"
+        return result
+
+    jobs.clear()
+    created = 0
+    report = execute_cron_install_spec(spec, wrong_prompt_tool, seam_verifier=valid_seam_evidence)
+    assert report["state"] == "rolled_back"
+    assert jobs == {}
+
+    jobs.clear()
+    created = 0
+    report = execute_cron_install_spec(spec, tool, seam_verifier=lambda: {})
+    assert report["state"] == "rolled_back"
+    assert jobs == {}
+
+
+def test_executor_consumes_supported_cronjob_json_results() -> None:
+    spec = build_cron_install_spec(
+        profile="default",
+        home_delivery="telegram",
+        operation="install",
+        visible_jobs=[],
+        attempt_nonce=NONCE,
+    )
+    stateful = FakeCronTool()
+
+    def json_tool(action: str, **arguments: Any) -> str:
+        return json.dumps(stateful(action, **arguments))
+
+    report = execute_cron_install_spec(spec, json_tool, seam_verifier=valid_seam_evidence)
+    assert report["state"] == "applied_paused"
+
+
+def test_tool_result_and_verification_boundaries_fail_closed() -> None:
+    with pytest.raises(ValidationError, match="execution spec"):
+        manager_install._digest("short")
+    assert manager_install._tool_mapping('{"success":true}') == {"success": True}
+    assert manager_install._tool_mapping("not-json") is None
+    assert manager_install._tool_mapping("[]") is None
+    assert manager_install._tool_mapping("x" * 1_000_001) is None
+    assert manager_install._tool_mapping([]) is None
+    assert manager_install._seam_evidence_is_valid(valid_seam_evidence())
+    incomplete = valid_seam_evidence()
+    incomplete.pop("cronjob_full_field_readback")
+    assert not manager_install._seam_evidence_is_valid(incomplete)
+    with pytest.raises(ValidationError, match="exactly read back"):
+        manager_install._expected_readback({"prompt": "x" * 101}, "synthetic-job", state="paused")
 
 
 @pytest.mark.parametrize(
@@ -717,7 +888,7 @@ def test_executor_rejects_bad_operations_and_reports_rollback_failures() -> None
 
     report = execute_cron_install_spec(spec, remove_fails)
     assert report["state"] == "rollback_failed"
-    assert report["rollback_failures"] == ["cyclops-manager-router"]
+    assert report["rollback_failures"] == ["cyclops-manager-router", "readback"]
 
 
 @pytest.mark.parametrize(
@@ -856,28 +1027,19 @@ def test_executor_rolls_back_after_tool_exception_or_unverified_pause() -> None:
         visible_jobs=[],
         attempt_nonce=NONCE,
     )
-    calls: list[tuple[str, str | None]] = []
+    stateful = FakeCronTool()
 
     def raises_on_second_create(action: str, **arguments: Any) -> dict[str, object]:
-        calls.append((action, arguments.get("job_id")))
-        if action == "create" and len([call for call in calls if call[0] == "create"]) == 1:
-            return {"success": True, "job_id": "created-router"}
-        if action == "pause":
-            return {"success": True, "job": {"state": "paused", "enabled": False}}
-        if action == "remove":
-            return {"success": True}
-        raise RuntimeError("synthetic tool failure")
+        if action == "create" and stateful.counts.get("create", 0) == 1:
+            stateful.calls.append((action, arguments.get("job_id")))
+            stateful.counts[action] = 2
+            raise RuntimeError("synthetic tool failure")
+        return stateful(action, **arguments)
 
     report = execute_cron_install_spec(spec, raises_on_second_create)
     assert report["state"] == "rolled_back"
-    assert calls[-1] == ("remove", "created-router")
+    assert stateful.calls[-2:] == [("remove", "created-1"), ("list", None)]
 
-    def pause_not_verified(action: str, **_arguments: Any) -> dict[str, object]:
-        if action == "create":
-            return {"success": True, "job_id": "created-router"}
-        if action == "pause":
-            return {"success": True, "job": {"state": "scheduled", "enabled": True}}
-        return {"success": True}
-
+    pause_not_verified = FakeCronTool(pause_state="scheduled")
     report = execute_cron_install_spec(spec, pause_not_verified)
     assert report["state"] == "rolled_back"

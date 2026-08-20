@@ -451,8 +451,9 @@ The explicit `--apply` staging transaction and its tool consumer MUST:
 4. verify hashes and script path containment without opening Hermes cron storage;
 5. emit create/update operations consumed by the supported profile-local `cronjob` tool and pause
    every newly created job before proceeding;
-6. run all disposable compatibility checks;
-7. read back exact job definitions;
+6. run the wheel-installed, synthetic-temporary-profile compatibility verifier;
+7. after every create, update, and pause, read back the complete tool-visible job list and compare
+   every security-relevant field of each present stable job with its snapshot-bound expected value;
 8. leave jobs paused and print the operator enable plan.
 
 No step enables, resumes, starts, or restarts a live job, timer, gateway, or service automatically.

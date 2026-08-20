@@ -57,6 +57,8 @@ def unscoped_router_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         "HERMES_KANBAN_RUN",
         "HERMES_KANBAN_RUN_ID",
         "HERMES_KANBAN_WORKSPACE",
+        "HERMES_KANBAN_WORKSPACES_ROOT",
+        "HERMES_KANBAN_DB",
         "HERMES_KANBAN_BOARD",
         "HERMES_KANBAN_BRANCH",
         "HERMES_KANBAN_CLAIM_LOCK",
@@ -130,6 +132,8 @@ def test_task_scope_is_denied_before_lease(tmp_path: Path) -> None:
             "HERMES_KANBAN_RUN",
             "HERMES_KANBAN_RUN_ID",
             "HERMES_KANBAN_WORKSPACE",
+            "HERMES_KANBAN_WORKSPACES_ROOT",
+            "HERMES_KANBAN_DB",
             "HERMES_KANBAN_BOARD",
             "HERMES_KANBAN_BRANCH",
             "HERMES_KANBAN_CLAIM_LOCK",
@@ -489,6 +493,33 @@ def test_wrong_token_and_stale_incident_ack_are_rejected(tmp_path: Path) -> None
                 condition_persists=lambda _incident: True,
                 now=103.0,
             )
+
+
+def test_ack_is_superseded_when_observation_fingerprint_churns_while_leased(
+    tmp_path: Path,
+) -> None:
+    with create_ledger(tmp_path / "ledger.db") as ledger:
+        ledger.observe_manager_incidents([observation()], tick_seq=1, now=100.0)
+        ledger.observe_manager_incidents([observation()], tick_seq=2, now=101.0)
+        context = manager_router_gate(ledger, now=101.0)["context"]
+        assert isinstance(context, dict)
+        ledger.observe_manager_incidents([observation(fingerprint="c" * 64)], tick_seq=3, now=102.0)
+
+        with pytest.raises(ValidationError, match="stale"):
+            import_manager_ack(
+                ledger,
+                _ack(context),
+                cron_execution_id="exec-churned",
+                condition_persists=lambda _incident: True,
+                now=103.0,
+            )
+
+        attempt = ledger.manager_attempt(str(context["attempt_id"]))
+        assert attempt is not None
+        assert attempt["state"] == "superseded"
+        incident = ledger.manager_incidents()[0]
+        assert incident["observation_sha256"] == "c" * 64
+        assert incident["lifecycle"] == "wake_sent"
 
 
 def test_clean_revalidation_resolves_without_notification(tmp_path: Path) -> None:
