@@ -153,6 +153,15 @@ def _inputs(tmp_path: Path) -> ActivationInputs:
     )
 
 
+def _private_profile_home(tmp_path: Path) -> Path:
+    home = tmp_path / ".hermes" / "profiles" / "default"
+    home.mkdir(parents=True, mode=0o700, exist_ok=True)
+    home.parent.parent.chmod(0o700)
+    home.parent.chmod(0o700)
+    home.chmod(0o700)
+    return home
+
+
 def test_absent_is_unchecked_and_exact_current_binding_is_supported(tmp_path: Path) -> None:
     absent = _inputs(tmp_path)
     absent.activation_path.unlink()
@@ -382,7 +391,7 @@ def test_first_use_deactivation_is_a_valid_durable_deny(tmp_path: Path) -> None:
 
 def test_private_current_evidence_loader_recollects_staged_inputs(tmp_path: Path) -> None:
     source = _inputs(tmp_path)
-    home = tmp_path / ".hermes" / "profiles" / "default"
+    home = _private_profile_home(tmp_path)
     stage_cron_install(source.install_spec, home)
     evidence_path = tmp_path / "current-evidence.json"
     evidence_path.write_text(
@@ -508,7 +517,7 @@ def test_deactivate_rejects_malformed_record_without_repair(tmp_path: Path) -> N
 
 def _staged_current_evidence(tmp_path: Path) -> tuple[ActivationInputs, Path, Path]:
     source = _inputs(tmp_path)
-    home = tmp_path / ".hermes" / "profiles" / "default"
+    home = _private_profile_home(tmp_path)
     stage_cron_install(source.install_spec, home)
     evidence_path = tmp_path / "current-hostile-evidence.json"
     evidence_path.write_text(
@@ -573,7 +582,7 @@ def _definition_payload(
 
 
 def _fake_hermes(tmp_path: Path, source: ActivationInputs) -> tuple[Path, Path]:
-    definitions = tmp_path / "definitions.json"
+    definitions = _private_profile_home(tmp_path) / "definitions.json"
     definitions.write_text(
         json.dumps(
             {
@@ -586,7 +595,7 @@ def _fake_hermes(tmp_path: Path, source: ActivationInputs) -> tuple[Path, Path]:
     binary = tmp_path / "hermes"
     binary.write_text(
         "#!/usr/bin/env python3\n"
-        "import json, pathlib, sys\n"
+        "import json, os, pathlib, sys\n"
         "if sys.argv[1:] == ['--version']:\n"
         "    print('Hermes Agent v0.9.0 (2026.8.20)')\n"
         "    print('Install directory: /synthetic/hermes')\n"
@@ -594,7 +603,7 @@ def _fake_hermes(tmp_path: Path, source: ActivationInputs) -> tuple[Path, Path]:
         "    print('OpenAI SDK: 2.24.0')\n"
         "elif len(sys.argv) == 5 and sys.argv[1:3] == ['cron', 'show'] "
         "and sys.argv[4] == '--json':\n"
-        "    path = pathlib.Path(__file__).with_name('definitions.json')\n"
+        "    path = pathlib.Path(os.environ['HERMES_HOME']) / 'definitions.json'\n"
         "    values = json.loads(path.read_text())\n"
         "    value = values.get(sys.argv[3])\n"
         "    if value is None:\n"
@@ -631,6 +640,39 @@ def test_loader_recollects_version_and_both_exact_definitions_from_hermes_cli(
     assert loaded.jobs["courier"]["job_id"] == source.jobs["courier"]["job_id"]
 
 
+def test_loader_sets_exact_authorized_profile_home_in_sanitized_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, home, evidence_path = _staged_current_evidence(tmp_path)
+    payloads = {
+        str(source.jobs["router"]["job_id"]): _definition_payload(source, "router"),
+        str(source.jobs["courier"]["job_id"]): _definition_payload(source, "courier"),
+    }
+    calls: list[dict[str, str]] = []
+
+    def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        calls.append(kwargs["env"])
+        output = (
+            b"Hermes Agent v0.9.0 (2026.8.20)\n"
+            if argv[1:] == ["--version"]
+            else json.dumps(payloads[argv[3]]).encode("utf-8")
+        )
+        return subprocess.CompletedProcess(argv, 0, stdout=output, stderr=b"")
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "other" / ".hermes" / "profiles" / "default"))
+    monkeypatch.setenv("API_TOKEN", "secret")
+    monkeypatch.setattr(activation_module.subprocess, "run", fake_run)
+    load_activation_inputs(
+        activation_path=source.activation_path,
+        hermes_home=home,
+        evidence_path=evidence_path,
+    )
+
+    assert len(calls) == 3
+    assert all(environment["HERMES_HOME"] == str(home) for environment in calls)
+    assert all("API_TOKEN" not in environment for environment in calls)
+
+
 def test_definition_adapter_uses_fixed_argv_bounds_and_sanitized_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -651,7 +693,8 @@ def test_definition_adapter_uses_fixed_argv_bounds_and_sanitized_environment(
 
     monkeypatch.setattr(activation_module.subprocess, "run", fake_run)
     adapter = HermesCronDefinitionAdapter(
-        environment={"PATH": "/usr/bin", "HOME": str(tmp_path), "API_TOKEN": "secret"}
+        hermes_home=_private_profile_home(tmp_path),
+        environment={"PATH": "/usr/bin", "HOME": str(tmp_path), "API_TOKEN": "secret"},
     )
     version, jobs = adapter.collect(
         {
@@ -706,7 +749,9 @@ def test_definition_adapter_rejects_wrong_protocol_identity_state_and_schema(
 
     monkeypatch.setattr(activation_module.subprocess, "run", fake_run)
     with pytest.raises(ValidationError, match="definition"):
-        HermesCronDefinitionAdapter().collect({"router": "job-router", "courier": "job-courier"})
+        HermesCronDefinitionAdapter(hermes_home=_private_profile_home(tmp_path)).collect(
+            {"router": "job-router", "courier": "job-courier"}
+        )
 
 
 @pytest.mark.parametrize(
@@ -719,6 +764,7 @@ def test_definition_adapter_rejects_wrong_protocol_identity_state_and_schema(
     ],
 )
 def test_definition_adapter_rejects_command_and_output_failures(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     completed: subprocess.CompletedProcess[bytes],
     message: str,
@@ -732,9 +778,9 @@ def test_definition_adapter_rejects_command_and_output_failures(
 
     monkeypatch.setattr(activation_module.subprocess, "run", fake_run)
     with pytest.raises(ValidationError, match=message):
-        HermesCronDefinitionAdapter(max_output_bytes=1024).collect(
-            {"router": "job-router", "courier": "job-courier"}
-        )
+        HermesCronDefinitionAdapter(
+            hermes_home=_private_profile_home(tmp_path), max_output_bytes=1024
+        ).collect({"router": "job-router", "courier": "job-courier"})
 
 
 @pytest.mark.parametrize(
@@ -745,25 +791,29 @@ def test_definition_adapter_rejects_command_and_output_failures(
     ],
 )
 def test_definition_adapter_rejects_timeout_and_missing_command(
-    monkeypatch: pytest.MonkeyPatch, failure: BaseException, message: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: BaseException, message: str
 ) -> None:
     def fail(*_args: Any, **_kwargs: Any) -> subprocess.CompletedProcess[bytes]:
         raise failure
 
     monkeypatch.setattr(activation_module.subprocess, "run", fail)
     with pytest.raises(ValidationError, match=message) as caught:
-        HermesCronDefinitionAdapter().collect({"router": "job-router", "courier": "job-courier"})
+        HermesCronDefinitionAdapter(hermes_home=_private_profile_home(tmp_path)).collect(
+            {"router": "job-router", "courier": "job-courier"}
+        )
     assert "synthetic private path" not in str(caught.value)
 
 
 def test_definition_adapter_rejects_invalid_configuration_identity_and_version(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    home = _private_profile_home(tmp_path)
     with pytest.raises(ValidationError, match="binary"):
-        HermesCronDefinitionAdapter(binary="")
+        HermesCronDefinitionAdapter(binary="", hermes_home=home)
     with pytest.raises(ValidationError, match="bounds"):
-        HermesCronDefinitionAdapter(timeout_seconds=0)
-    adapter = HermesCronDefinitionAdapter()
+        HermesCronDefinitionAdapter(hermes_home=home, timeout_seconds=0)
+    adapter = HermesCronDefinitionAdapter(hermes_home=home)
     with pytest.raises(ValidationError, match="incomplete"):
         adapter.collect({"router": "job-router"})
     with pytest.raises(ValidationError, match="identity"):
@@ -817,9 +867,8 @@ def test_definition_adapter_normalizes_supported_schedule_and_repeat_forms(
         return subprocess.CompletedProcess(argv, 0, stdout=output, stderr=b"")
 
     monkeypatch.setattr(activation_module.subprocess, "run", fake_run)
-    _version, jobs = HermesCronDefinitionAdapter().collect(
-        {"router": "job-router", "courier": "job-courier"}
-    )
+    adapter = HermesCronDefinitionAdapter(hermes_home=_private_profile_home(tmp_path))
+    _version, jobs = adapter.collect({"router": "job-router", "courier": "job-courier"})
     assert jobs["router"]["schedule"] == expected_schedule
     assert jobs["router"]["repeat"] == expected_repeat
 
@@ -840,17 +889,31 @@ def test_definition_adapter_preserves_all_normalized_delivery_classes(
         return subprocess.CompletedProcess(argv, 0, stdout=output, stderr=b"")
 
     monkeypatch.setattr(activation_module.subprocess, "run", fake_run)
-    _version, jobs = HermesCronDefinitionAdapter().collect(
-        {"router": "job-router", "courier": "job-courier"}
-    )
+    adapter = HermesCronDefinitionAdapter(hermes_home=_private_profile_home(tmp_path))
+    _version, jobs = adapter.collect({"router": "job-router", "courier": "job-courier"})
     assert jobs["router"]["deliver"] == ["telegram", "local"]
 
 
 def test_actual_prompt_drift_after_attestation_denies_router_and_matches_projection(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source, home, evidence_path = _staged_current_evidence(tmp_path)
     binary, definitions_path = _fake_hermes(tmp_path, source)
+    ambient_home = tmp_path / "ambient" / ".hermes" / "profiles" / "default"
+    ambient_home.mkdir(parents=True, mode=0o700)
+    ambient_definitions = {
+        str(source.jobs["router"]["job_id"]): _definition_payload(
+            source, "router", prompt="ambient unauthorized prompt"
+        ),
+        str(source.jobs["courier"]["job_id"]): _definition_payload(
+            source, "courier", prompt="ambient unauthorized prompt"
+        ),
+    }
+    (ambient_home / "definitions.json").write_text(
+        json.dumps(ambient_definitions), encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(ambient_home))
 
     def current_verdict() -> ActivationVerdict:
         return activation_verdict(
@@ -950,6 +1013,26 @@ def test_loader_rejects_unsafe_evidence_spec_script_and_profile(tmp_path: Path) 
             hermes_home=tmp_path / "default",
             evidence_path=evidence_path,
         )
+    home.chmod(0o750)
+    with pytest.raises(ValidationError, match=r"profile.*unsafe"):
+        load_activation_inputs(
+            activation_path=source.activation_path, hermes_home=home, evidence_path=evidence_path
+        )
+    home.chmod(0o700)
+    home.parent.chmod(0o755)
+    with pytest.raises(ValidationError, match=r"profile.*unsafe"):
+        load_activation_inputs(
+            activation_path=source.activation_path, hermes_home=home, evidence_path=evidence_path
+        )
+    home.parent.chmod(0o700)
+    linked_home = tmp_path / "linked-default"
+    linked_home.symlink_to(home, target_is_directory=True)
+    with pytest.raises(ValidationError, match=r"noncanonical|unsafe"):
+        load_activation_inputs(
+            activation_path=source.activation_path,
+            hermes_home=linked_home,
+            evidence_path=evidence_path,
+        )
     spec_path = home / "cyclops" / "manager-install.json"
     spec_path.chmod(0o644)
     with pytest.raises(ValidationError, match="unsafe"):
@@ -963,6 +1046,20 @@ def test_loader_rejects_unsafe_evidence_spec_script_and_profile(tmp_path: Path) 
         load_activation_inputs(
             activation_path=source.activation_path, hermes_home=home, evidence_path=evidence_path
         )
+
+
+def test_definition_adapter_rejects_missing_and_wrong_owner_profile_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    missing = tmp_path / ".hermes" / "profiles" / "default"
+    with pytest.raises(ValidationError, match="unavailable"):
+        HermesCronDefinitionAdapter(hermes_home=missing)
+
+    home = _private_profile_home(tmp_path)
+    owner = home.stat().st_uid
+    monkeypatch.setattr(activation_module.os, "getuid", lambda: owner + 1)
+    with pytest.raises(ValidationError, match=r"profile.*unsafe"):
+        HermesCronDefinitionAdapter(hermes_home=home)
 
 
 def test_activation_apply_requires_recollection_and_stable_target(tmp_path: Path) -> None:

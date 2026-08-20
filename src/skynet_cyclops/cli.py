@@ -103,12 +103,7 @@ def _activation_paths(
     evidence_path = (
         Path(evidence) if evidence else ledger_path.parent / "manager-current-evidence.json"
     )
-    configured_home = hermes_home or os.environ.get("HERMES_HOME")
-    profile_home = (
-        Path(configured_home)
-        if configured_home
-        else Path.home() / ".hermes" / "profiles" / "default"
-    )
+    profile_home = Path(hermes_home) if hermes_home is not None else config.hermes_home
     return activation_path, evidence_path, profile_home
 
 

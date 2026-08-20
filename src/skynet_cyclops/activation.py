@@ -173,6 +173,35 @@ def canonical_sha256(value: object) -> str:
     return hashlib.sha256(canonical_bytes(value)).hexdigest()
 
 
+def _canonical_private_profile_home(path: Path) -> Path:
+    root = Path(path)
+    if (
+        not root.is_absolute()
+        or root.name != "default"
+        or root.parent.name != "profiles"
+        or root.parent.parent.name != ".hermes"
+    ):
+        raise ValidationError("activation Hermes profile is noncanonical")
+    owner = os.getuid() if hasattr(os, "getuid") else None
+    try:
+        if root.resolve(strict=True) != root:
+            raise ValidationError("activation Hermes profile is unsafe")
+        for directory in (root.parent.parent, root.parent, root):
+            info = directory.lstat()
+            if (
+                directory.is_symlink()
+                or not stat.S_ISDIR(info.st_mode)
+                or (owner is not None and info.st_uid != owner)
+                or stat.S_IMODE(info.st_mode) & 0o077
+            ):
+                raise ValidationError("activation Hermes profile is unsafe")
+    except ValidationError:
+        raise
+    except OSError as exc:
+        raise ValidationError("activation Hermes profile is unavailable") from exc
+    return root
+
+
 class HermesCronDefinitionAdapter:
     """Collect only version and exact cron definitions through supported CLI calls."""
 
@@ -180,6 +209,7 @@ class HermesCronDefinitionAdapter:
         self,
         binary: str = "hermes",
         *,
+        hermes_home: Path,
         timeout_seconds: int = HERMES_READBACK_TIMEOUT_SECONDS,
         collection_timeout_seconds: int = HERMES_READBACK_COLLECTION_SECONDS,
         max_output_bytes: int = MAX_HERMES_READBACK_BYTES,
@@ -198,6 +228,7 @@ class HermesCronDefinitionAdapter:
         self.collection_timeout_seconds = collection_timeout_seconds
         self.max_output_bytes = max_output_bytes
         self.environment = sanitize_environment(environment)
+        self.environment["HERMES_HOME"] = str(_canonical_private_profile_home(hermes_home))
 
     def _run(self, arguments: tuple[str, ...], *, deadline: float) -> str:
         remaining = deadline - time.monotonic()
@@ -751,9 +782,7 @@ def load_activation_inputs(
         or not seam_evidence_is_valid(evidence.get("seam_evidence"))
     ):
         raise ValidationError("activation evidence schema is invalid")
-    root = Path(hermes_home)
-    if not root.is_absolute() or root.name != "default" or root.parent.name != "profiles":
-        raise ValidationError("activation Hermes profile is noncanonical")
+    root = _canonical_private_profile_home(hermes_home)
     spec_value = _read_private_json(
         root / "cyclops" / "manager-install.json", maximum_bytes=MAX_EVIDENCE_BYTES
     )
@@ -790,9 +819,9 @@ def load_activation_inputs(
         if not isinstance(job_id, str) or not _SAFE_ID.fullmatch(job_id):
             raise ValidationError("activation evidence job identity is invalid")
         job_ids[name] = job_id
-    hermes_version, current_jobs = HermesCronDefinitionAdapter(binary=hermes_binary).collect(
-        job_ids
-    )
+    hermes_version, current_jobs = HermesCronDefinitionAdapter(
+        binary=hermes_binary, hermes_home=root
+    ).collect(job_ids)
     return ActivationInputs(
         activation_path=activation_path,
         release=RELEASE,

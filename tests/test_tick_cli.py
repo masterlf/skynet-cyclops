@@ -44,12 +44,22 @@ def test_default_state_paths_follow_xdg_state_home(
     assert default_status_path() == tmp_path / "skynet-cyclops" / "status.json"
 
 
+def test_configured_default_profile_home_is_deterministic_without_ambient_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    manifest = write_manifest(tmp_path / "mission.yaml")
+    config = load_config(config_file(tmp_path, manifest))
+    assert config.hermes_home == tmp_path / ".hermes" / "profiles" / "default"
+
+
 def config_file(tmp_path: Path, manifest: Path) -> Path:
     config = {
         "schema_version": 1,
         "manifest_path": str(manifest),
         "ledger_path": str(tmp_path / "state" / "ledger.db"),
         "status_path": str(tmp_path / "state" / "status.json"),
+        "hermes_home": str(tmp_path / ".hermes" / "profiles" / "default"),
         "hermes_binary": "hermes",
         "incident_debounce_ticks": 2,
     }
@@ -335,6 +345,58 @@ def test_cli_manager_activate_and_deactivate_are_dry_run_first(
     assert [apply for _now, apply in calls] == [False, True, False]
 
 
+def test_router_and_tick_use_configured_profile_not_ambient_hermes_home(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_path = write_manifest(tmp_path / "mission.yaml")
+    config = config_file(tmp_path, manifest_path)
+    configured_home = tmp_path / ".hermes" / "profiles" / "default"
+    ambient_home = tmp_path / "ambient" / ".hermes" / "profiles" / "default"
+    monkeypatch.setenv("HERMES_HOME", str(ambient_home))
+    observed: list[Path] = []
+
+    def load_current(**kwargs: object) -> object:
+        observed.append(kwargs["hermes_home"])  # type: ignore[arg-type]
+        return object()
+
+    monkeypatch.setattr(cli, "load_activation_inputs", load_current)
+    monkeypatch.setattr(
+        cli,
+        "activation_verdict",
+        lambda _inputs: ActivationVerdict("supported", "supported", True),
+    )
+    with Ledger.create(tmp_path / "state" / "ledger.db"):
+        pass
+
+    def route_with_activation(*_args: object, **kwargs: object) -> dict[str, bool]:
+        kwargs["activation_check"]()  # type: ignore[operator]
+        return {"wakeAgent": False}
+
+    monkeypatch.setattr(cli, "manager_router_gate", route_with_activation)
+    assert main(["manager", "router", "--config", str(config)]) == ExitCode.OK
+    assert json.loads(capsys.readouterr().out) == {"wakeAgent": False}
+
+    tick_payload = {
+        "schema_version": 1,
+        "projection_version": 1,
+        "supervisor": {"mode": "observe", "state": "ok"},
+        "missions": [],
+        "incidents": [],
+        "cost": {"classification": "unknown"},
+    }
+
+    def run_tick_with_activation(*_args: object, **kwargs: object) -> dict[str, object]:
+        kwargs["activation_check"]()  # type: ignore[operator]
+        return tick_payload
+
+    monkeypatch.setattr(cli, "run_tick", run_tick_with_activation)
+    assert main(["tick", "--config", str(config), "--json"]) == ExitCode.OK
+    assert json.loads(capsys.readouterr().out) == tick_payload
+    assert observed == [configured_home, configured_home]
+
+
 def test_manifest_binding_mismatch_fails_closed_without_collection(tmp_path: Path) -> None:
     manifest = parse_manifest(manifest_data())
     ledger_path = tmp_path / "ledger.db"
@@ -370,6 +432,7 @@ def test_completed_tick_has_no_incidents_and_reports_done(tmp_path: Path) -> Non
     [
         lambda value: value.__setitem__("schema_version", 2),
         lambda value: value.__setitem__("ledger_path", ""),
+        lambda value: value.__setitem__("hermes_home", "relative/profile"),
         lambda value: value.__setitem__("hermes_binary", "bad\x00binary"),
         lambda value: value.__setitem__("incident_debounce_ticks", True),
         lambda value: value.update(extra=True),

@@ -16,6 +16,11 @@ The repository helper is dry-run by default. With `--apply`, it installs only th
 ~/.local/state/skynet-cyclops/
 ```
 
+The strict configuration includes one explicit canonical `hermes_home` (normally
+`~/.hermes/profiles/default`). Router and tick readbacks set that exact value for child Hermes
+commands; ambient `HERMES_HOME` is ignored. The `.hermes`, `profiles`, and `default` directories
+must be owner-only, owned by the Cyclops process user, and free of symbolic links.
+
 Install the Python package separately to provide `~/.local/bin/skynet-cyclops`. The helper installs a functional synthetic mission path and never overwrites an existing operator config or mission on rerun. It never installs the package, enables or starts the timer, or enables the dashboard plugin. System packages or root installation are not required for the user-service path.
 
 ## Safe rollout
