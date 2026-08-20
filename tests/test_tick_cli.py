@@ -50,7 +50,7 @@ def test_configured_default_profile_home_is_deterministic_without_ambient_env(
     monkeypatch.delenv("HERMES_HOME", raising=False)
     manifest = write_manifest(tmp_path / "mission.yaml")
     config = load_config(config_file(tmp_path, manifest))
-    assert config.hermes_home == tmp_path / ".hermes" / "profiles" / "default"
+    assert config.hermes_home == tmp_path / ".hermes"
 
 
 def config_file(tmp_path: Path, manifest: Path) -> Path:
@@ -59,7 +59,7 @@ def config_file(tmp_path: Path, manifest: Path) -> Path:
         "manifest_path": str(manifest),
         "ledger_path": str(tmp_path / "state" / "ledger.db"),
         "status_path": str(tmp_path / "state" / "status.json"),
-        "hermes_home": str(tmp_path / ".hermes" / "profiles" / "default"),
+        "hermes_home": str(tmp_path / ".hermes"),
         "hermes_binary": "hermes",
         "incident_debounce_ticks": 2,
     }
@@ -255,10 +255,11 @@ def test_cli_manager_install_dry_run_emits_spec_and_apply_only_stages(
     assert main(arguments) == ExitCode.OK
     spec = json.loads(capsys.readouterr().out)
     assert spec["protocol"] == "cyclops-cron-install/v1"
-    assert spec["release"] == "0.2.1"
+    assert spec["release"] == "0.2.2"
     snapshot = tmp_path / "snapshot.json"
     snapshot.write_text("[]\n", encoding="utf-8")
-    profile = tmp_path / "profile"
+    profile = tmp_path / ".hermes"
+    profile.mkdir(mode=0o700)
     assert (
         main(
             [
@@ -352,8 +353,8 @@ def test_router_and_tick_use_configured_profile_not_ambient_hermes_home(
 ) -> None:
     manifest_path = write_manifest(tmp_path / "mission.yaml")
     config = config_file(tmp_path, manifest_path)
-    configured_home = tmp_path / ".hermes" / "profiles" / "default"
-    ambient_home = tmp_path / "ambient" / ".hermes" / "profiles" / "default"
+    configured_home = tmp_path / ".hermes"
+    ambient_home = tmp_path / "ambient" / ".hermes" / "profiles" / "other"
     monkeypatch.setenv("HERMES_HOME", str(ambient_home))
     observed: list[Path] = []
 
@@ -395,6 +396,27 @@ def test_router_and_tick_use_configured_profile_not_ambient_hermes_home(
     assert main(["tick", "--config", str(config), "--json"]) == ExitCode.OK
     assert json.loads(capsys.readouterr().out) == tick_payload
     assert observed == [configured_home, configured_home]
+
+
+@pytest.mark.parametrize(
+    "configured_home",
+    [
+        "/private/.hermes/profiles/default",
+        "/private/.hermes/profiles/other",
+        "/private/default",
+    ],
+)
+def test_config_rejects_noncanonical_default_profile_homes(
+    tmp_path: Path, configured_home: str
+) -> None:
+    manifest = write_manifest(tmp_path / "mission.yaml")
+    path = config_file(tmp_path, manifest)
+    value = yaml.safe_load(path.read_text(encoding="utf-8"))
+    value["hermes_home"] = configured_home
+    path.write_text(yaml.safe_dump(value), encoding="utf-8")
+
+    with pytest.raises(ValidationError, match="noncanonical"):
+        load_config(path)
 
 
 def test_manifest_binding_mismatch_fails_closed_without_collection(tmp_path: Path) -> None:

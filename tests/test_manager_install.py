@@ -24,6 +24,13 @@ from skynet_cyclops.manager_install import (
 NONCE = "7" * 64
 
 
+def private_default_home(parent: Path) -> Path:
+    home = parent / ".hermes"
+    home.mkdir(parents=True, mode=0o700)
+    home.chmod(0o700)
+    return home
+
+
 def visible_job(name: str, job_id: str) -> dict[str, object]:
     courier = name == "cyclops-decision-courier"
     prompt = "" if courier else MANAGER_PROMPT
@@ -197,7 +204,7 @@ def test_initial_spec_is_closed_machine_readable_and_rolls_back_new_ids() -> Non
         "rollback",
     }
     assert spec["protocol"] == "cyclops-cron-install/v1"
-    assert spec["release"] == "0.2.1"
+    assert spec["release"] == "0.2.2"
     assert spec["attempt_nonce"] == NONCE
     assert [item["action"] for item in spec["operations"]] == ["create", "create"]
     assert spec["operations"][0]["arguments"]["enabled_toolsets"] == ["no_mcp"]
@@ -340,10 +347,11 @@ def test_stage_writes_only_private_hash_verified_artifacts(tmp_path: Path) -> No
         visible_jobs=[],
         attempt_nonce=NONCE,
     )
-    result = stage_cron_install(spec, tmp_path / "profile")
+    home = private_default_home(tmp_path)
+    result = stage_cron_install(spec, home)
     assert result["state"] == "staged"
-    scripts = tmp_path / "profile" / "scripts"
-    config = tmp_path / "profile" / "cyclops" / "manager-install.json"
+    scripts = home / "scripts"
+    config = home / "cyclops" / "manager-install.json"
     assert stat.S_IMODE(scripts.stat().st_mode) == 0o700
     assert stat.S_IMODE(config.parent.stat().st_mode) == 0o700
     assert stat.S_IMODE(config.stat().st_mode) == 0o600
@@ -352,13 +360,14 @@ def test_stage_writes_only_private_hash_verified_artifacts(tmp_path: Path) -> No
         path = scripts / artifact["name"]
         assert path.is_file()
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
-    assert not any("cron" in path.name for path in (tmp_path / "profile").iterdir())
+    assert not any("cron" in path.name for path in home.iterdir())
 
 
 def test_stage_rejects_symlink_without_partial_replacement(tmp_path: Path) -> None:
-    profile = tmp_path / "profile"
+    profile = tmp_path / ".hermes"
     scripts = profile / "scripts"
     scripts.mkdir(parents=True)
+    profile.chmod(0o700)
     outside = tmp_path / "outside"
     outside.write_text("operator-owned\n", encoding="utf-8")
     (scripts / "cyclops-manager-router.py").symlink_to(outside)
@@ -489,6 +498,10 @@ def test_stage_and_executor_reject_tampered_specs(tmp_path: Path) -> None:
         stage_cron_install(tampered, tmp_path / "profile")
     with pytest.raises(ValidationError, match="profile home"):
         stage_cron_install(spec, Path("relative"))
+    with pytest.raises(ValidationError, match="profile home"):
+        stage_cron_install(spec, tmp_path / ".hermes" / "profiles" / "default")
+    with pytest.raises(ValidationError, match="profile home"):
+        stage_cron_install(spec, tmp_path / "missing" / ".hermes")
     tampered = json.loads(json.dumps(spec))
     tampered["artifacts"][0]["sha256"] = "0" * 64
     with pytest.raises(ValidationError, match="spec schema"):
@@ -713,14 +726,16 @@ def test_stage_rejects_unsafe_directories_targets_and_artifacts(
     )
     real = tmp_path / "real"
     real.mkdir()
-    linked = tmp_path / "linked"
+    linked = tmp_path / ".hermes"
     linked.symlink_to(real, target_is_directory=True)
-    with pytest.raises(ValidationError, match="directory"):
+    with pytest.raises(ValidationError, match="profile home"):
         stage_cron_install(spec, linked)
+    linked.unlink()
 
-    profile = tmp_path / "profile"
+    profile = tmp_path / ".hermes"
     target = profile / "scripts" / "cyclops-manager-router.py"
     target.mkdir(parents=True)
+    profile.chmod(0o700)
     with pytest.raises(ValidationError, match="regular file"):
         stage_cron_install(spec, profile)
     target.rmdir()
@@ -732,16 +747,22 @@ def test_stage_rejects_unsafe_directories_targets_and_artifacts(
     malformed = json.loads(json.dumps(spec))
     malformed["artifacts"] = []
     with pytest.raises(ValidationError, match="spec schema"):
-        stage_cron_install(malformed, tmp_path / "other")
+        stage_cron_install(malformed, tmp_path / "other" / ".hermes")
     malformed = json.loads(json.dumps(spec))
     malformed["artifacts"][0]["extra"] = True
     with pytest.raises(ValidationError, match="spec schema"):
-        stage_cron_install(malformed, tmp_path / "another")
+        stage_cron_install(malformed, tmp_path / "another" / ".hermes")
 
+    shared = tmp_path / "shared" / ".hermes"
+    shared.mkdir(parents=True, mode=0o750)
+    with pytest.raises(ValidationError, match="profile home"):
+        stage_cron_install(spec, shared)
+
+    owned = private_default_home(tmp_path / "owned")
     current_uid = os.getuid()
     monkeypatch.setattr(manager_install.os, "getuid", lambda: current_uid + 1)
-    with pytest.raises(ValidationError, match="ownership"):
-        stage_cron_install(spec, tmp_path / "owned")
+    with pytest.raises(ValidationError, match="profile home"):
+        stage_cron_install(spec, owned)
 
 
 def test_stage_fails_closed_on_write_and_readback_errors(
@@ -760,7 +781,7 @@ def test_stage_fails_closed_on_write_and_readback_errors(
 
     monkeypatch.setattr(manager_install, "_atomic_private_write", fail_private_write)
     with pytest.raises(ValidationError, match="write failed"):
-        stage_cron_install(spec, tmp_path / "write-fail")
+        stage_cron_install(spec, private_default_home(tmp_path / "write-fail"))
     monkeypatch.undo()
 
     real_read_bytes = Path.read_bytes
@@ -773,7 +794,7 @@ def test_stage_fails_closed_on_write_and_readback_errors(
 
     monkeypatch.setattr(Path, "read_bytes", tamper_first_read)
     with pytest.raises(ValidationError, match="hash verification"):
-        hash_fail_profile = tmp_path / "hash-fail"
+        hash_fail_profile = private_default_home(tmp_path / "hash-fail")
         stage_cron_install(spec, hash_fail_profile)
     assert not (hash_fail_profile / "scripts" / "cyclops-manager-router.py").exists()
     assert not (hash_fail_profile / "scripts" / "cyclops-decision-courier.py").exists()
@@ -782,7 +803,7 @@ def test_stage_fails_closed_on_write_and_readback_errors(
 
     monkeypatch.setattr(manager_install.json, "loads", lambda _value: {})
     with pytest.raises(ValidationError, match="config verification"):
-        config_fail_profile = tmp_path / "config-fail"
+        config_fail_profile = private_default_home(tmp_path / "config-fail")
         stage_cron_install(spec, config_fail_profile)
     assert not (config_fail_profile / "scripts" / "cyclops-manager-router.py").exists()
     assert not (config_fail_profile / "scripts" / "cyclops-decision-courier.py").exists()
@@ -793,11 +814,12 @@ def test_stage_fails_closed_on_write_and_readback_errors(
 def test_stage_write_failure_restores_exact_pre_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail_on_write: int
 ) -> None:
-    profile = tmp_path / "profile"
+    profile = tmp_path / ".hermes"
     scripts = profile / "scripts"
     config_dir = profile / "cyclops"
     scripts.mkdir(parents=True)
     config_dir.mkdir()
+    profile.chmod(0o700)
     targets = [
         scripts / "cyclops-manager-router.py",
         scripts / "cyclops-decision-courier.py",
@@ -836,7 +858,7 @@ def test_stage_write_failure_restores_exact_pre_state(
 def test_stage_write_failure_removes_files_created_by_attempt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail_on_write: int
 ) -> None:
-    profile = tmp_path / "profile"
+    profile = private_default_home(tmp_path)
     spec = build_cron_install_spec(
         profile="default",
         home_delivery="telegram",
@@ -866,9 +888,10 @@ def test_stage_write_failure_removes_files_created_by_attempt(
 def test_stage_rollback_refuses_file_changed_outside_transaction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    profile = tmp_path / "profile"
+    profile = tmp_path / ".hermes"
     router = profile / "scripts" / "cyclops-manager-router.py"
     router.parent.mkdir(parents=True)
+    profile.chmod(0o700)
     router.write_text("old-router", encoding="utf-8")
     router.chmod(0o600)
     spec = build_cron_install_spec(
@@ -1165,7 +1188,8 @@ def test_seam_verifier_subprocess_has_private_minimal_environment_and_no_parent_
             "PYTHONUTF8",
         }
         assert environment["HOME"] != os.environ["HOME"]
-        assert Path(environment["HERMES_HOME"]).is_relative_to(Path(environment["HOME"]))
+        child_home = Path(environment["HERMES_HOME"])
+        assert child_home == Path(environment["HOME"]) / ".hermes"
         assert kwargs["timeout"] == 60
         assert kwargs["shell"] is False
         assert str(kwargs["cwd"]) == environment["HOME"]

@@ -2,6 +2,22 @@
 
 All notable changes to this project are documented here. The project follows Semantic Versioning after public releases.
 
+## [0.2.2] - 2026-08-20
+
+### Fixed
+
+- Model the canonical Hermes `default` home as the explicit owner-private `<home>/.hermes` root;
+  reject the nonexistent `profiles/default` topology, named-profile homes, symbolic links, shared
+  modes, wrong ownership, and ambient fallback.
+- Set `HERMES_HOME` to that exact validated root for every fresh Hermes version, definition, and
+  disposable compatibility-verifier subprocess while preserving same-ID isolation from named
+  profiles.
+
+### Security
+
+- Default-profile activation and staging now fail closed before readback or writes when the explicit
+  home is missing, noncanonical, aliased, shared, or owned by another user.
+
 ## [0.2.1] - 2026-08-20
 
 ### Added

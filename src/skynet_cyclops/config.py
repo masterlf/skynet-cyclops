@@ -85,12 +85,7 @@ def load_config(path: str | os.PathLike[str]) -> Config:
     ):
         raise ValidationError("configuration hermes_home is invalid")
     hermes_home = Path(home_value).expanduser()
-    if (
-        not hermes_home.is_absolute()
-        or hermes_home.name != "default"
-        or hermes_home.parent.name != "profiles"
-        or hermes_home.parent.parent.name != ".hermes"
-    ):
+    if not hermes_home.is_absolute() or hermes_home.name != ".hermes":
         raise ValidationError("configuration hermes_home is noncanonical")
     binary = raw["hermes_binary"]
     debounce = raw["incident_debounce_ticks"]

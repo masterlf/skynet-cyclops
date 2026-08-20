@@ -418,7 +418,7 @@ Before enabling wake mode, the installer verifies on a disposable paused job and
 
 Any failed or ambiguous check sets compatibility state `unsupported`, leaves jobs paused, and preserves observe-only operation. Runtime version drift invalidates cached seam approval until checks pass again.
 
-v0.2.1 persists that approval only as an owner-private atomic activation attestation. Every router
+v0.2.2 persists that approval only as an owner-private atomic activation attestation. Every router
 invocation and status tick obtains the current Hermes version plus both exact definitions through the
 fixed-argv read-only CLI adapter, then calls the same side-effect-free validator immediately. No
 stored evidence age can authorize. Absent evidence maps to `unchecked,false`; a current disabled

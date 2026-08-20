@@ -154,10 +154,8 @@ def _inputs(tmp_path: Path) -> ActivationInputs:
 
 
 def _private_profile_home(tmp_path: Path) -> Path:
-    home = tmp_path / ".hermes" / "profiles" / "default"
-    home.mkdir(parents=True, mode=0o700, exist_ok=True)
-    home.parent.parent.chmod(0o700)
-    home.parent.chmod(0o700)
+    home = tmp_path / ".hermes"
+    home.mkdir(mode=0o700, exist_ok=True)
     home.chmod(0o700)
     return home
 
@@ -659,7 +657,7 @@ def test_loader_sets_exact_authorized_profile_home_in_sanitized_environment(
         )
         return subprocess.CompletedProcess(argv, 0, stdout=output, stderr=b"")
 
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "other" / ".hermes" / "profiles" / "default"))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "other" / ".hermes" / "profiles" / "other"))
     monkeypatch.setenv("API_TOKEN", "secret")
     monkeypatch.setattr(activation_module.subprocess, "run", fake_run)
     load_activation_inputs(
@@ -900,7 +898,7 @@ def test_actual_prompt_drift_after_attestation_denies_router_and_matches_project
 ) -> None:
     source, home, evidence_path = _staged_current_evidence(tmp_path)
     binary, definitions_path = _fake_hermes(tmp_path, source)
-    ambient_home = tmp_path / "ambient" / ".hermes" / "profiles" / "default"
+    ambient_home = tmp_path / ".hermes" / "profiles" / "other"
     ambient_home.mkdir(parents=True, mode=0o700)
     ambient_definitions = {
         str(source.jobs["router"]["job_id"]): _definition_payload(
@@ -1007,25 +1005,24 @@ def test_loader_rejects_unsafe_evidence_spec_script_and_profile(tmp_path: Path) 
             activation_path=source.activation_path, hermes_home=home, evidence_path=evidence_path
         )
     evidence_path.chmod(0o600)
-    with pytest.raises(ValidationError, match="noncanonical"):
-        load_activation_inputs(
-            activation_path=source.activation_path,
-            hermes_home=tmp_path / "default",
-            evidence_path=evidence_path,
-        )
+    for noncanonical_home in (
+        tmp_path / "default",
+        tmp_path / ".hermes" / "profiles" / "default",
+        tmp_path / ".hermes" / "profiles" / "other",
+    ):
+        with pytest.raises(ValidationError, match="noncanonical"):
+            load_activation_inputs(
+                activation_path=source.activation_path,
+                hermes_home=noncanonical_home,
+                evidence_path=evidence_path,
+            )
     home.chmod(0o750)
     with pytest.raises(ValidationError, match=r"profile.*unsafe"):
         load_activation_inputs(
             activation_path=source.activation_path, hermes_home=home, evidence_path=evidence_path
         )
     home.chmod(0o700)
-    home.parent.chmod(0o755)
-    with pytest.raises(ValidationError, match=r"profile.*unsafe"):
-        load_activation_inputs(
-            activation_path=source.activation_path, hermes_home=home, evidence_path=evidence_path
-        )
-    home.parent.chmod(0o700)
-    linked_home = tmp_path / "linked-default"
+    linked_home = tmp_path / "linked-hermes"
     linked_home.symlink_to(home, target_is_directory=True)
     with pytest.raises(ValidationError, match=r"noncanonical|unsafe"):
         load_activation_inputs(
@@ -1051,7 +1048,7 @@ def test_loader_rejects_unsafe_evidence_spec_script_and_profile(tmp_path: Path) 
 def test_definition_adapter_rejects_missing_and_wrong_owner_profile_home(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    missing = tmp_path / ".hermes" / "profiles" / "default"
+    missing = tmp_path / "missing" / ".hermes"
     with pytest.raises(ValidationError, match="unavailable"):
         HermesCronDefinitionAdapter(hermes_home=missing)
 

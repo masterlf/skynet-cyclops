@@ -24,7 +24,7 @@ from .errors import ValidationError
 from .manager import MANAGER_PROMPT
 
 _PROTOCOL = "cyclops-cron-install/v1"
-_RELEASE = "0.2.1"
+_RELEASE = "0.2.2"
 _STABLE_NAMES = ("cyclops-manager-router", "cyclops-decision-courier")
 _HEX = frozenset("0123456789abcdef")
 _SPEC_KEYS = frozenset(
@@ -597,17 +597,30 @@ def _restore_target(path: Path, previous: tuple[bytes, int] | None, attempted: b
 
 
 def stage_cron_install(spec: Mapping[str, object], hermes_home: Path) -> dict[str, object]:
-    """Stage private artifacts under one explicit profile home; never touch cron storage."""
+    """Stage private artifacts under the explicit default Hermes home; never touch cron storage."""
     try:
         validated_spec = _validate_cron_install_spec(dict(spec))
     except ValidationError as exc:
         raise ValidationError("cron install spec schema is invalid") from exc
     root = Path(hermes_home)
-    if not root.is_absolute() or root == Path(root.anchor):
+    if not root.is_absolute() or root.name != ".hermes":
         raise ValidationError("Hermes profile home is unsafe")
     scripts = root / "scripts"
     config_dir = root / "cyclops"
-    _private_directory(root)
+    try:
+        info = root.lstat()
+        if (
+            root.resolve(strict=True) != root
+            or root.is_symlink()
+            or not stat.S_ISDIR(info.st_mode)
+            or (hasattr(os, "getuid") and info.st_uid != os.getuid())
+            or stat.S_IMODE(info.st_mode) & 0o077
+        ):
+            raise ValidationError("Hermes profile home is unsafe")
+    except ValidationError:
+        raise
+    except OSError as exc:
+        raise ValidationError("Hermes profile home is unavailable") from exc
     _private_directory(scripts)
     _private_directory(config_dir)
     artifacts = cast(list[dict[str, object]], validated_spec["artifacts"])
@@ -841,7 +854,7 @@ def _run_hermes_seam_verifier() -> Mapping[str, object]:
     with tempfile.TemporaryDirectory(prefix="cyclops-hermes-verifier-") as temporary:
         home = Path(temporary) / "home"
         home.mkdir(mode=0o700)
-        hermes_home = home / ".hermes" / "profiles" / "default"
+        hermes_home = home / ".hermes"
         environment = {
             "HOME": str(home),
             "HERMES_HOME": str(hermes_home),
