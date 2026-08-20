@@ -26,7 +26,7 @@ from .errors import ValidationError
 
 ACTIVATION_PROTOCOL = "cyclops-manager-activation/v1"
 SEAM_PROTOCOL = "cyclops-hermes-seam-evidence/v1"
-RELEASE = "0.2.1"
+RELEASE = "0.2.2"
 MAX_ACTIVATION_BYTES = 16 * 1024
 MAX_EVIDENCE_BYTES = 256 * 1024
 MAX_HERMES_READBACK_BYTES = 1024 * 1024
@@ -175,26 +175,20 @@ def canonical_sha256(value: object) -> str:
 
 def _canonical_private_profile_home(path: Path) -> Path:
     root = Path(path)
-    if (
-        not root.is_absolute()
-        or root.name != "default"
-        or root.parent.name != "profiles"
-        or root.parent.parent.name != ".hermes"
-    ):
+    if not root.is_absolute() or root.name != ".hermes":
         raise ValidationError("activation Hermes profile is noncanonical")
     owner = os.getuid() if hasattr(os, "getuid") else None
     try:
         if root.resolve(strict=True) != root:
             raise ValidationError("activation Hermes profile is unsafe")
-        for directory in (root.parent.parent, root.parent, root):
-            info = directory.lstat()
-            if (
-                directory.is_symlink()
-                or not stat.S_ISDIR(info.st_mode)
-                or (owner is not None and info.st_uid != owner)
-                or stat.S_IMODE(info.st_mode) & 0o077
-            ):
-                raise ValidationError("activation Hermes profile is unsafe")
+        info = root.lstat()
+        if (
+            root.is_symlink()
+            or not stat.S_ISDIR(info.st_mode)
+            or (owner is not None and info.st_uid != owner)
+            or stat.S_IMODE(info.st_mode) & 0o077
+        ):
+            raise ValidationError("activation Hermes profile is unsafe")
     except ValidationError:
         raise
     except OSError as exc:

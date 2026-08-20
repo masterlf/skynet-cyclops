@@ -3,6 +3,6 @@ schema_version: 1
 manifest_path: ~/.config/skynet-cyclops/mission.yaml
 ledger_path: ~/.local/state/skynet-cyclops/ledger.db
 status_path: ~/.local/state/skynet-cyclops/status.json
-hermes_home: ~/.hermes/profiles/default
+hermes_home: ~/.hermes
 hermes_binary: hermes
 incident_debounce_ticks: 2

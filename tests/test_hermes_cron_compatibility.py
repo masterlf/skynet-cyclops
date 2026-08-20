@@ -19,7 +19,7 @@ def test_disposable_default_profile_cron_seams(tmp_path: Path) -> None:
     environment = {
         **os.environ,
         "HOME": str(tmp_path / "home"),
-        "HERMES_HOME": str(tmp_path / "home" / ".hermes" / "profiles" / "default"),
+        "HERMES_HOME": str(tmp_path / "home" / ".hermes"),
         "PYTHONPATH": os.pathsep.join((str(REPO / "src"), str(HERMES_SOURCE))),
     }
     completed = subprocess.run(  # noqa: S603 - current interpreter and repository harness

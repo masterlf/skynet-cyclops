@@ -17,9 +17,10 @@ The repository helper is dry-run by default. With `--apply`, it installs only th
 ```
 
 The strict configuration includes one explicit canonical `hermes_home` (normally
-`~/.hermes/profiles/default`). Router and tick readbacks set that exact value for child Hermes
-commands; ambient `HERMES_HOME` is ignored. The `.hermes`, `profiles`, and `default` directories
-must be owner-only, owned by the Cyclops process user, and free of symbolic links.
+`~/.hermes`). Router and tick readbacks set that exact value for every child Hermes command;
+ambient `HERMES_HOME` is ignored. The canonical `default` profile is the owner-only `.hermes`
+directory itself; named profiles live under `.hermes/profiles/<name>`. Cyclops rejects
+`profiles/default`, named-profile homes, symbolic links, shared modes, and wrong ownership.
 
 Install the Python package separately to provide `~/.local/bin/skynet-cyclops`. The helper installs a functional synthetic mission path and never overwrites an existing operator config or mission on rerun. It never installs the package, enables or starts the timer, or enables the dashboard plugin. System packages or root installation are not required for the user-service path.
 
@@ -61,7 +62,7 @@ names to be absent. Then stage only private scripts/config and emit the nonce-bo
 
 ```bash
 cyclops manager install --profile default --home-delivery telegram --apply \
-  --snapshot /private/path/cron-jobs.json --hermes-home /private/default-profile-home
+  --snapshot /private/path/cron-jobs.json --hermes-home /private/.hermes
 ```
 
 The profile-local agent consumes only the emitted `cyclops-cron-install/v1` operations. After each
@@ -106,10 +107,10 @@ session history is never sufficient evidence.
 # Both forms perform identical validation; the first writes nothing.
 cyclops manager activate --config /path/to/config.yaml \
   --evidence /private/current-evidence.json \
-  --hermes-home /private/.hermes/profiles/default
+  --hermes-home /private/.hermes
 cyclops manager activate --config /path/to/config.yaml \
   --evidence /private/current-evidence.json \
-  --hermes-home /private/.hermes/profiles/default --apply
+  --hermes-home /private/.hermes --apply
 ```
 
 Apply acquires a private lock, re-reads the local bindings/spec/scripts, recollects the current Hermes
@@ -156,7 +157,7 @@ For a manager-package rollback, first apply deactivation and verify the shared v
 `wake_enabled=false`. Then pause router and courier using supported `cronjob` operations and obtain
 exact full-definition readback proving both are paused. Only then restore package/spec/scripts.
 Never resume v0.2.0 jobs: that release does not enforce activation attestation. If paused readback
-cannot be proven, leave v0.2.1 installed and fail the rollback closed.
+cannot be proven, leave v0.2.2 installed and fail the rollback closed.
 
 ## Troubleshooting
 
