@@ -71,6 +71,7 @@ def test_initial_spec_is_closed_machine_readable_and_rolls_back_new_ids() -> Non
         "attempt_nonce",
         "profile",
         "operation",
+        "snapshot",
         "snapshot_sha256",
         "artifacts",
         "operations",
@@ -384,7 +385,7 @@ def test_stage_and_executor_reject_tampered_specs(tmp_path: Path) -> None:
         stage_cron_install(spec, Path("relative"))
     tampered = json.loads(json.dumps(spec))
     tampered["artifacts"][0]["sha256"] = "0" * 64
-    with pytest.raises(ValidationError, match="integrity"):
+    with pytest.raises(ValidationError, match="spec schema"):
         stage_cron_install(tampered, tmp_path / "profile")
     with pytest.raises(ValidationError, match="execution spec"):
         execute_cron_install_spec({**spec, "protocol": "wrong"}, lambda **_kwargs: {})
@@ -458,6 +459,32 @@ def test_upgrade_rejects_malformed_prior_spec(mutate: Any) -> None:
         )
 
 
+@pytest.mark.parametrize("operations", [[None, None], [{}, None]])
+def test_upgrade_rejects_non_mapping_prior_operations(operations: list[object]) -> None:
+    installed = build_cron_install_spec(
+        profile="default",
+        home_delivery="telegram",
+        operation="install",
+        visible_jobs=[],
+        attempt_nonce="6" * 64,
+    )
+    malformed = json.loads(json.dumps(installed))
+    malformed["operations"] = operations
+
+    with pytest.raises(ValidationError, match="prior spec"):
+        build_cron_install_spec(
+            profile="default",
+            home_delivery="telegram",
+            operation="upgrade",
+            visible_jobs=[
+                visible_job("cyclops-manager-router", "job-router"),
+                visible_job("cyclops-decision-courier", "job-courier"),
+            ],
+            previous_spec=malformed,
+            attempt_nonce=NONCE,
+        )
+
+
 def test_stage_rejects_unsafe_directories_targets_and_artifacts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -488,11 +515,11 @@ def test_stage_rejects_unsafe_directories_targets_and_artifacts(
 
     malformed = json.loads(json.dumps(spec))
     malformed["artifacts"] = []
-    with pytest.raises(ValidationError, match="artifacts"):
+    with pytest.raises(ValidationError, match="spec schema"):
         stage_cron_install(malformed, tmp_path / "other")
     malformed = json.loads(json.dumps(spec))
     malformed["artifacts"][0]["extra"] = True
-    with pytest.raises(ValidationError, match="artifact schema"):
+    with pytest.raises(ValidationError, match="spec schema"):
         stage_cron_install(malformed, tmp_path / "another")
 
     current_uid = os.getuid()
@@ -512,22 +539,145 @@ def test_stage_fails_closed_on_write_and_readback_errors(
         attempt_nonce=NONCE,
     )
 
-    def fail_fchmod(*_args: object) -> None:
-        raise OSError("synthetic")
+    def fail_private_write(*_args: object) -> None:
+        raise ValidationError("private staging write failed")
 
-    monkeypatch.setattr(manager_install.os, "fchmod", fail_fchmod)
+    monkeypatch.setattr(manager_install, "_atomic_private_write", fail_private_write)
     with pytest.raises(ValidationError, match="write failed"):
         stage_cron_install(spec, tmp_path / "write-fail")
     monkeypatch.undo()
 
-    monkeypatch.setattr(Path, "read_bytes", lambda _path: b"tampered")
+    real_read_bytes = Path.read_bytes
+    reads = 0
+
+    def tamper_first_read(path: Path) -> bytes:
+        nonlocal reads
+        reads += 1
+        return b"tampered" if reads == 1 else real_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", tamper_first_read)
     with pytest.raises(ValidationError, match="hash verification"):
-        stage_cron_install(spec, tmp_path / "hash-fail")
+        hash_fail_profile = tmp_path / "hash-fail"
+        stage_cron_install(spec, hash_fail_profile)
+    assert not (hash_fail_profile / "scripts" / "cyclops-manager-router.py").exists()
+    assert not (hash_fail_profile / "scripts" / "cyclops-decision-courier.py").exists()
+    assert not (hash_fail_profile / "cyclops" / "manager-install.json").exists()
     monkeypatch.undo()
 
     monkeypatch.setattr(manager_install.json, "loads", lambda _value: {})
     with pytest.raises(ValidationError, match="config verification"):
-        stage_cron_install(spec, tmp_path / "config-fail")
+        config_fail_profile = tmp_path / "config-fail"
+        stage_cron_install(spec, config_fail_profile)
+    assert not (config_fail_profile / "scripts" / "cyclops-manager-router.py").exists()
+    assert not (config_fail_profile / "scripts" / "cyclops-decision-courier.py").exists()
+    assert not (config_fail_profile / "cyclops" / "manager-install.json").exists()
+
+
+@pytest.mark.parametrize("fail_on_write", [2, 3])
+def test_stage_write_failure_restores_exact_pre_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail_on_write: int
+) -> None:
+    profile = tmp_path / "profile"
+    scripts = profile / "scripts"
+    config_dir = profile / "cyclops"
+    scripts.mkdir(parents=True)
+    config_dir.mkdir()
+    targets = [
+        scripts / "cyclops-manager-router.py",
+        scripts / "cyclops-decision-courier.py",
+        config_dir / "manager-install.json",
+    ]
+    for index, target in enumerate(targets):
+        target.write_bytes(f"old-{index}".encode())
+        target.chmod(0o400 if index == 0 else 0o600)
+    before = [(target.read_bytes(), stat.S_IMODE(target.stat().st_mode)) for target in targets]
+    spec = build_cron_install_spec(
+        profile="default",
+        home_delivery="telegram",
+        operation="install",
+        visible_jobs=[],
+        attempt_nonce=NONCE,
+    )
+    real_write = manager_install._atomic_private_write
+    writes = 0
+
+    def fail_after_prior_replacements(path: Path, content: bytes) -> None:
+        nonlocal writes
+        writes += 1
+        if writes == fail_on_write:
+            raise ValidationError("synthetic write failure")
+        real_write(path, content)
+
+    monkeypatch.setattr(manager_install, "_atomic_private_write", fail_after_prior_replacements)
+    with pytest.raises(ValidationError, match="synthetic write failure"):
+        stage_cron_install(spec, profile)
+
+    after = [(target.read_bytes(), stat.S_IMODE(target.stat().st_mode)) for target in targets]
+    assert after == before
+
+
+@pytest.mark.parametrize("fail_on_write", [2, 3])
+def test_stage_write_failure_removes_files_created_by_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail_on_write: int
+) -> None:
+    profile = tmp_path / "profile"
+    spec = build_cron_install_spec(
+        profile="default",
+        home_delivery="telegram",
+        operation="install",
+        visible_jobs=[],
+        attempt_nonce=NONCE,
+    )
+    real_write = manager_install._atomic_private_write
+    writes = 0
+
+    def fail_after_prior_replacements(path: Path, content: bytes) -> None:
+        nonlocal writes
+        writes += 1
+        if writes == fail_on_write:
+            raise ValidationError("synthetic write failure")
+        real_write(path, content)
+
+    monkeypatch.setattr(manager_install, "_atomic_private_write", fail_after_prior_replacements)
+    with pytest.raises(ValidationError, match="synthetic write failure"):
+        stage_cron_install(spec, profile)
+
+    assert not (profile / "scripts" / "cyclops-manager-router.py").exists()
+    assert not (profile / "scripts" / "cyclops-decision-courier.py").exists()
+    assert not (profile / "cyclops" / "manager-install.json").exists()
+
+
+def test_stage_rollback_refuses_file_changed_outside_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile = tmp_path / "profile"
+    router = profile / "scripts" / "cyclops-manager-router.py"
+    router.parent.mkdir(parents=True)
+    router.write_text("old-router", encoding="utf-8")
+    router.chmod(0o600)
+    spec = build_cron_install_spec(
+        profile="default",
+        home_delivery="telegram",
+        operation="install",
+        visible_jobs=[],
+        attempt_nonce=NONCE,
+    )
+    real_write = manager_install._atomic_private_write
+    writes = 0
+
+    def change_then_fail(path: Path, content: bytes) -> None:
+        nonlocal writes
+        writes += 1
+        if writes == 2:
+            router.write_text("operator-change", encoding="utf-8")
+            raise ValidationError("synthetic write failure")
+        real_write(path, content)
+
+    monkeypatch.setattr(manager_install, "_atomic_private_write", change_then_fail)
+    with pytest.raises(ValidationError, match="rollback failed"):
+        stage_cron_install(spec, profile)
+
+    assert router.read_text(encoding="utf-8") == "operator-change"
 
 
 def test_executor_rejects_bad_operations_and_reports_rollback_failures() -> None:
@@ -549,11 +699,16 @@ def test_executor_rejects_bad_operations_and_reports_rollback_failures() -> None
 
     rollback_bad = json.loads(json.dumps(spec))
     rollback_bad["rollback"] = [None, {"action": "resume", "stable_name": "bad"}]
-    report = execute_cron_install_spec(
-        rollback_bad, lambda _action, **_arguments: {"success": False}
-    )
-    assert report["state"] == "rollback_failed"
-    assert report["rollback_failures"] == ["invalid-rollback-entry", "bad"]
+    calls = 0
+
+    def must_not_call(_action: str, **_arguments: Any) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return {"success": False}
+
+    with pytest.raises(ValidationError, match="execution spec"):
+        execute_cron_install_spec(rollback_bad, must_not_call)
+    assert calls == 0
 
     def remove_fails(action: str, **_arguments: Any) -> dict[str, object]:
         if action == "create":
@@ -563,6 +718,134 @@ def test_executor_rejects_bad_operations_and_reports_rollback_failures() -> None
     report = execute_cron_install_spec(spec, remove_fails)
     assert report["state"] == "rollback_failed"
     assert report["rollback_failures"] == ["cyclops-manager-router"]
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        lambda value: value.__setitem__("extra", True),
+        lambda value: value.__setitem__("profile", "manager"),
+        lambda value: value.__setitem__("snapshot_sha256", "0" * 64),
+        lambda value: value["artifacts"][0].__setitem__("content", "tampered"),
+        lambda value: value["operations"][1].__setitem__("arguments", "wrong"),
+        lambda value: value.__setitem__("rollback", []),
+        lambda value: value["operations"][0].__setitem__("stable_name", "unrelated"),
+        lambda value: value["operations"][0]["arguments"].__setitem__("deliver", "all"),
+        lambda value: value["rollback"].reverse(),
+    ],
+)
+def test_executor_rejects_semantic_tampering_before_tool_call(tamper: Any) -> None:
+    spec = build_cron_install_spec(
+        profile="default",
+        home_delivery="telegram",
+        operation="install",
+        visible_jobs=[],
+        attempt_nonce=NONCE,
+    )
+    tampered = json.loads(json.dumps(spec))
+    tamper(tampered)
+    calls = 0
+
+    def tool(_action: str, **_arguments: Any) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return {"success": True}
+
+    with pytest.raises(ValidationError, match="execution spec"):
+        execute_cron_install_spec(tampered, tool)
+    assert calls == 0
+
+
+def test_executor_rejects_unrelated_upgrade_target_before_tool_call() -> None:
+    installed = build_cron_install_spec(
+        profile="default",
+        home_delivery="telegram",
+        operation="install",
+        visible_jobs=[],
+        attempt_nonce="6" * 64,
+    )
+    spec = build_cron_install_spec(
+        profile="default",
+        home_delivery="telegram",
+        operation="upgrade",
+        visible_jobs=[
+            visible_job("cyclops-manager-router", "job-router"),
+            visible_job("cyclops-decision-courier", "job-courier"),
+        ],
+        previous_spec=installed,
+        attempt_nonce=NONCE,
+    )
+    tampered = json.loads(json.dumps(spec))
+    tampered["operations"][0]["arguments"]["job_id"] = "unrelated-job"
+    calls = 0
+
+    def tool(_action: str, **_arguments: Any) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return {"success": True}
+
+    with pytest.raises(ValidationError, match="execution spec"):
+        execute_cron_install_spec(tampered, tool)
+    assert calls == 0
+
+
+def test_executor_binds_consistently_tampered_upgrade_ids_to_snapshot() -> None:
+    installed = build_cron_install_spec(
+        profile="default",
+        home_delivery="telegram",
+        operation="install",
+        visible_jobs=[],
+        attempt_nonce="6" * 64,
+    )
+    spec = build_cron_install_spec(
+        profile="default",
+        home_delivery="telegram",
+        operation="upgrade",
+        visible_jobs=[
+            visible_job("cyclops-manager-router", "job-router"),
+            visible_job("cyclops-decision-courier", "job-courier"),
+        ],
+        previous_spec=installed,
+        attempt_nonce=NONCE,
+    )
+    tampered = json.loads(json.dumps(spec))
+    tampered["operations"][0]["job_id"] = "unrelated-job"
+    tampered["operations"][0]["arguments"]["job_id"] = "unrelated-job"
+    tampered["rollback"][1]["job_id"] = "unrelated-job"
+    tampered["rollback"][1]["arguments"]["job_id"] = "unrelated-job"
+    calls = 0
+
+    def tool(_action: str, **_arguments: Any) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return {"success": True}
+
+    with pytest.raises(ValidationError, match="execution spec"):
+        execute_cron_install_spec(tampered, tool)
+    assert calls == 0
+
+
+def test_executor_rejects_direct_verification_tampering_before_tool_call() -> None:
+    spec = build_cron_install_spec(
+        profile="default",
+        home_delivery="telegram",
+        operation="install",
+        visible_jobs=[],
+        attempt_nonce=NONCE,
+    )
+    verification = spec["verification"]
+    assert isinstance(verification, dict)
+    verification["jobs_paused"] = False
+    calls = 0
+
+    def tool(_action: str, **_arguments: Any) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return {"success": True}
+
+    with pytest.raises(ValidationError, match="execution spec"):
+        execute_cron_install_spec(spec, tool)
+    assert calls == 0
 
 
 def test_executor_rolls_back_after_tool_exception_or_unverified_pause() -> None:

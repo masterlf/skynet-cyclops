@@ -6,13 +6,15 @@ script/config artifacts and emits operations for the supported profile-local ``c
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
 import secrets
 import stat
 import tempfile
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import cast
 
@@ -23,6 +25,21 @@ _PROTOCOL = "cyclops-cron-install/v1"
 _RELEASE = "0.2.0"
 _STABLE_NAMES = ("cyclops-manager-router", "cyclops-decision-courier")
 _HEX = frozenset("0123456789abcdef")
+_SPEC_KEYS = frozenset(
+    {
+        "protocol",
+        "release",
+        "attempt_nonce",
+        "profile",
+        "operation",
+        "snapshot",
+        "snapshot_sha256",
+        "artifacts",
+        "operations",
+        "verification",
+        "rollback",
+    }
+)
 _VISIBLE_REQUIRED = frozenset(
     {
         "job_id",
@@ -64,6 +81,19 @@ _VISIBLE_OPTIONAL = frozenset(
 CronTool = Callable[..., object]
 
 
+def _verification() -> dict[str, object]:
+    return {
+        "hermes_seam_evidence_protocol": "cyclops-hermes-seam-evidence/v1",
+        "jobs_paused": True,
+        "stable_names_exactly_once": True,
+        "resolved_toolsets": {"cyclops-manager-router": []},
+        "quiet_no_agent": True,
+        "task_scope_denied": True,
+        "bounded_output_bytes": 4096,
+        "exact_output_matches": 1,
+    }
+
+
 def _canonical(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
 
@@ -81,6 +111,27 @@ def _nonce(value: str | None) -> str:
     ):
         raise ValidationError("install attempt nonce is invalid")
     return candidate
+
+
+def _digest(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in _HEX for character in value)
+    ):
+        raise ValidationError("cron install execution spec is invalid")
+    return value
+
+
+def _home_delivery(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 256
+        or any(character.isspace() or ord(character) < 33 for character in value)
+    ):
+        raise ValidationError("home_delivery is invalid")
+    return value
 
 
 def _validate_visible_jobs(value: object) -> list[dict[str, object]]:
@@ -163,13 +214,17 @@ def _validate_previous_spec(value: object) -> dict[str, object]:
     operations = value.get("operations")
     if not isinstance(operations, list) or len(operations) != 2:
         raise ValidationError("upgrade prior spec is incomplete")
-    if [item.get("stable_name") for item in operations if isinstance(item, dict)] != list(
-        _STABLE_NAMES
-    ):
+    if not all(isinstance(item, dict) for item in operations):
+        raise ValidationError("upgrade prior spec operations are invalid")
+    typed_operations = cast(list[dict[str, object]], operations)
+    if [item.get("stable_name") for item in typed_operations] != list(_STABLE_NAMES):
         raise ValidationError("upgrade prior spec identity is invalid")
-    if any(not isinstance(item.get("arguments"), dict) for item in operations):
+    if any(not isinstance(item.get("arguments"), dict) for item in typed_operations):
         raise ValidationError("upgrade prior spec arguments are invalid")
-    return value
+    try:
+        return _validate_cron_install_spec(value)
+    except ValidationError as exc:
+        raise ValidationError("upgrade requires the exact prior spec") from exc
 
 
 def build_cron_install_spec(
@@ -184,13 +239,7 @@ def build_cron_install_spec(
     """Return a closed machine-readable plan for the profile-local cronjob tool."""
     if profile != "default":
         raise ValidationError("manager profile must be default")
-    if (
-        not isinstance(home_delivery, str)
-        or not home_delivery
-        or len(home_delivery) > 256
-        or any(character.isspace() or ord(character) < 33 for character in home_delivery)
-    ):
-        raise ValidationError("home_delivery is invalid")
+    home_delivery = _home_delivery(home_delivery)
     if operation not in {"install", "upgrade"}:
         raise ValidationError("install operation is invalid")
     nonce = _nonce(attempt_nonce)
@@ -267,27 +316,156 @@ def build_cron_install_spec(
                 },
             )
 
-    return {
+    spec: dict[str, object] = {
         "protocol": _PROTOCOL,
         "release": _RELEASE,
         "attempt_nonce": nonce,
         "profile": "default",
         "operation": operation,
+        "snapshot": snapshot,
         "snapshot_sha256": _sha256(snapshot),
         "artifacts": artifacts,
         "operations": operations,
-        "verification": {
-            "hermes_seam_evidence_protocol": "cyclops-hermes-seam-evidence/v1",
-            "jobs_paused": True,
-            "stable_names_exactly_once": True,
-            "resolved_toolsets": {"cyclops-manager-router": []},
-            "quiet_no_agent": True,
-            "task_scope_denied": True,
-            "bounded_output_bytes": 4096,
-            "exact_output_matches": 1,
-        },
+        "verification": _verification(),
         "rollback": rollback,
     }
+    _validate_cron_install_spec(spec)
+    return spec
+
+
+def _validate_cron_install_spec(value: object) -> dict[str, object]:
+    """Validate the complete closed mutation contract before any side effect."""
+    try:
+        if not isinstance(value, dict) or set(value) != _SPEC_KEYS:
+            raise ValidationError("cron install execution spec is invalid")
+        if (
+            value.get("protocol") != _PROTOCOL
+            or value.get("release") != _RELEASE
+            or value.get("profile") != "default"
+            or value.get("verification") != _verification()
+        ):
+            raise ValidationError("cron install execution spec is invalid")
+        nonce = _nonce(cast(str | None, value.get("attempt_nonce")))
+        snapshot_digest = _digest(value.get("snapshot_sha256"))
+        snapshot = _validate_visible_jobs(value.get("snapshot"))
+        if _sha256(snapshot) != snapshot_digest:
+            raise ValidationError("cron install execution spec is invalid")
+        snapshot_by_name = {
+            name: [item for item in snapshot if item["name"] == name] for name in _STABLE_NAMES
+        }
+        operation = value.get("operation")
+        operations = value.get("operations")
+        rollback = value.get("rollback")
+        if operation not in {"install", "upgrade"} or not isinstance(operations, list):
+            raise ValidationError("cron install execution spec is invalid")
+        if len(operations) != 2 or not all(isinstance(item, dict) for item in operations):
+            raise ValidationError("cron install operation is invalid")
+        if not isinstance(rollback, list) or len(rollback) != 2:
+            raise ValidationError("cron install execution spec is invalid")
+        typed_operations = cast(list[dict[str, object]], operations)
+        if any(item.get("action") not in {"create", "update"} for item in typed_operations):
+            raise ValidationError("cron install action is invalid")
+
+        expected_artifacts = [
+            {
+                "name": item["name"],
+                "content": item["content"],
+                "sha256": hashlib.sha256(item["content"].encode()).hexdigest(),
+                "mode": "0600",
+            }
+            for item in _scripts(nonce)
+        ]
+        if value.get("artifacts") != expected_artifacts:
+            raise ValidationError("cron install execution spec is invalid")
+
+        courier_arguments = typed_operations[1].get("arguments")
+        if not isinstance(courier_arguments, dict):
+            raise ValidationError("cron install execution spec is invalid")
+        current_arguments = _job_arguments(_home_delivery(courier_arguments.get("deliver")))
+
+        if operation == "install":
+            expected_operations = [
+                {
+                    "action": "create",
+                    "stable_name": name,
+                    "arguments": arguments,
+                    "pause_after_create": True,
+                    "expected_state": "paused",
+                }
+                for name, arguments in zip(_STABLE_NAMES, current_arguments, strict=True)
+            ]
+            expected_rollback = [
+                {
+                    "action": "remove",
+                    "operation_index": index,
+                    "stable_name": _STABLE_NAMES[index],
+                    "requires_created_job_id": True,
+                }
+                for index in (1, 0)
+            ]
+            if any(snapshot_by_name.values()):
+                raise ValidationError("cron install execution spec is invalid")
+        else:
+            if any(len(matches) != 1 for matches in snapshot_by_name.values()):
+                raise ValidationError("cron install execution spec is invalid")
+            job_ids: list[str] = []
+            snapshot_digests: list[str] = []
+            expected_operations = []
+            for index, (name, arguments) in enumerate(
+                zip(_STABLE_NAMES, current_arguments, strict=True)
+            ):
+                item = typed_operations[index]
+                job_id = item.get("job_id")
+                snapshot_job = snapshot_by_name[name][0]
+                if (
+                    not isinstance(job_id, str)
+                    or not job_id
+                    or len(job_id) > 128
+                    or job_id in job_ids
+                    or snapshot_job["job_id"] != job_id
+                    or snapshot_job["state"] != "paused"
+                    or snapshot_job["enabled"] is not False
+                ):
+                    raise ValidationError("cron install execution spec is invalid")
+                item_snapshot_digest = _digest(item.get("snapshot_sha256"))
+                if _sha256(snapshot_job) != item_snapshot_digest:
+                    raise ValidationError("cron install execution spec is invalid")
+                job_ids.append(job_id)
+                snapshot_digests.append(item_snapshot_digest)
+                expected_operations.append(
+                    {
+                        "action": "update",
+                        "stable_name": name,
+                        "job_id": job_id,
+                        "arguments": {**arguments, "job_id": job_id},
+                        "expected_state": "paused",
+                        "snapshot_sha256": item_snapshot_digest,
+                    }
+                )
+
+            if not all(isinstance(item, dict) for item in rollback):
+                raise ValidationError("cron install execution spec is invalid")
+            typed_rollback = cast(list[dict[str, object]], rollback)
+            prior_courier_arguments = typed_rollback[0].get("arguments")
+            if not isinstance(prior_courier_arguments, dict):
+                raise ValidationError("cron install execution spec is invalid")
+            prior_arguments = _job_arguments(_home_delivery(prior_courier_arguments.get("deliver")))
+            expected_rollback = [
+                {
+                    "action": "update",
+                    "stable_name": _STABLE_NAMES[index],
+                    "job_id": job_ids[index],
+                    "arguments": {**prior_arguments[index], "job_id": job_ids[index]},
+                    "restore_snapshot_sha256": snapshot_digests[index],
+                }
+                for index in (1, 0)
+            ]
+
+        if operations != expected_operations or rollback != expected_rollback:
+            raise ValidationError("cron install execution spec is invalid")
+        return value
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValidationError("cron install execution spec is invalid") from exc
 
 
 def _private_directory(path: Path) -> None:
@@ -336,21 +514,64 @@ def _atomic_private_write(path: Path, content: bytes) -> None:
         raise ValidationError("private staging write failed") from exc
 
 
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def _installer_lock(path: Path) -> Iterator[None]:
+    _preflight_target(path)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        os.fchmod(descriptor, 0o600)
+        stream = os.fdopen(descriptor, "a+b", closefd=True)
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            stream.close()
+    except OSError as exc:
+        raise ValidationError("installer lock failed") from exc
+
+
+def _restore_target(path: Path, previous: tuple[bytes, int] | None, attempted: bytes) -> None:
+    _preflight_target(path)
+    if path.exists():
+        current = path.read_bytes()
+        allowed = {attempted}
+        if previous is not None:
+            allowed.add(previous[0])
+        if current not in allowed:
+            raise ValidationError("staging target changed during transaction")
+    if previous is None:
+        path.unlink(missing_ok=True)
+        _fsync_directory(path.parent)
+        return
+    content, mode = previous
+    _atomic_private_write(path, content)
+    os.chmod(path, mode)
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    _fsync_directory(path.parent)
+
+
 def stage_cron_install(spec: Mapping[str, object], hermes_home: Path) -> dict[str, object]:
     """Stage private artifacts under one explicit profile home; never touch cron storage."""
-    if spec.get("protocol") != _PROTOCOL or set(spec) != {
-        "protocol",
-        "release",
-        "attempt_nonce",
-        "profile",
-        "operation",
-        "snapshot_sha256",
-        "artifacts",
-        "operations",
-        "verification",
-        "rollback",
-    }:
-        raise ValidationError("cron install spec schema is invalid")
+    try:
+        validated_spec = _validate_cron_install_spec(dict(spec))
+    except ValidationError as exc:
+        raise ValidationError("cron install spec schema is invalid") from exc
     root = Path(hermes_home)
     if not root.is_absolute() or root == Path(root.anchor):
         raise ValidationError("Hermes profile home is unsafe")
@@ -359,42 +580,55 @@ def stage_cron_install(spec: Mapping[str, object], hermes_home: Path) -> dict[st
     _private_directory(root)
     _private_directory(scripts)
     _private_directory(config_dir)
-    artifacts = spec.get("artifacts")
-    if not isinstance(artifacts, list) or len(artifacts) != 2:
-        raise ValidationError("cron install artifacts are invalid")
-    targets: list[tuple[Path, bytes, str]] = []
-    for artifact in artifacts:
-        if not isinstance(artifact, dict) or set(artifact) != {"name", "content", "sha256", "mode"}:
-            raise ValidationError("cron install artifact schema is invalid")
-        name = artifact["name"]
-        content = artifact["content"]
-        digest = artifact["sha256"]
-        if (
-            not isinstance(name, str)
-            or Path(name).name != name
-            or not isinstance(content, str)
-            or not isinstance(digest, str)
-            or hashlib.sha256(content.encode()).hexdigest() != digest
-            or artifact["mode"] != "0600"
-        ):
-            raise ValidationError("cron install artifact integrity is invalid")
-        targets.append((scripts / name, content.encode(), digest))
+    artifacts = cast(list[dict[str, object]], validated_spec["artifacts"])
+    targets = [
+        (
+            scripts / cast(str, artifact["name"]),
+            cast(str, artifact["content"]).encode(),
+            cast(str, artifact["sha256"]),
+        )
+        for artifact in artifacts
+    ]
     config = config_dir / "manager-install.json"
-    for target, _content, _digest in targets:
-        _preflight_target(target)
-    _preflight_target(config)
-    for target, content, digest in targets:
-        _atomic_private_write(target, content)
-        if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
-            raise ValidationError("staged script hash verification failed")
-    config_bytes = _canonical(spec)
-    _atomic_private_write(config, config_bytes)
-    if json.loads(config.read_text(encoding="utf-8")) != spec:
-        raise ValidationError("staged install config verification failed")
+    config_bytes = _canonical(validated_spec)
+    all_targets = [item[0] for item in targets] + [config]
+    attempted = {target: content for target, content, _digest_value in targets}
+    attempted[config] = config_bytes
+    with _installer_lock(config_dir / "manager-install.lock"):
+        for target in all_targets:
+            _preflight_target(target)
+        previous = {
+            target: None
+            if not target.exists()
+            else (target.read_bytes(), stat.S_IMODE(target.stat().st_mode))
+            for target in all_targets
+        }
+        try:
+            for target, content, digest in targets:
+                _atomic_private_write(target, content)
+                if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+                    raise ValidationError("staged script hash verification failed")
+            _atomic_private_write(config, config_bytes)
+            if json.loads(config.read_text(encoding="utf-8")) != validated_spec:
+                raise ValidationError("staged install config verification failed")
+        except Exception as exc:
+            rollback_failures: list[str] = []
+            for target in reversed(all_targets):
+                try:
+                    _restore_target(target, previous[target], attempted[target])
+                except Exception:
+                    rollback_failures.append(target.name)
+            if rollback_failures:
+                raise ValidationError(
+                    "private staging rollback failed: " + ", ".join(rollback_failures)
+                ) from exc
+            if isinstance(exc, ValidationError):
+                raise
+            raise ValidationError("private staging failed") from exc
     return {
         "state": "staged",
         "protocol": _PROTOCOL,
-        "attempt_nonce": spec["attempt_nonce"],
+        "attempt_nonce": validated_spec["attempt_nonce"],
         "artifact_sha256": [item[2] for item in targets],
         "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
     }
@@ -413,28 +647,17 @@ def _tool_job_is_paused(result: object) -> bool:
 
 def execute_cron_install_spec(spec: Mapping[str, object], tool: CronTool) -> dict[str, object]:
     """Reference fail-closed interpreter for the emitted supported-tool operations."""
-    if spec.get("protocol") != _PROTOCOL or spec.get("release") != _RELEASE:
-        raise ValidationError("cron install execution spec is invalid")
-    _nonce(cast(str | None, spec.get("attempt_nonce")))
-    operation = spec.get("operation")
-    operations = spec.get("operations")
-    rollback = spec.get("rollback")
-    if (
-        operation not in {"install", "upgrade"}
-        or not isinstance(operations, list)
-        or not isinstance(rollback, list)
-    ):
-        raise ValidationError("cron install execution spec is invalid")
+    validated_spec = _validate_cron_install_spec(dict(spec))
+    operation = validated_spec["operation"]
+    operations = cast(list[dict[str, object]], validated_spec["operations"])
+    rollback = cast(list[dict[str, object]], validated_spec["rollback"])
     created: dict[int, str] = {}
     failed = False
     for index, item in enumerate(operations):
-        if not isinstance(item, dict) or not isinstance(item.get("arguments"), dict):
-            raise ValidationError("cron install operation is invalid")
-        action = item.get("action")
-        if action not in {"create", "update"}:
-            raise ValidationError("cron install action is invalid")
+        arguments = cast(dict[str, object], item["arguments"])
+        action = cast(str, item["action"])
         try:
-            result = tool(str(action), **item["arguments"])
+            result = tool(str(action), **arguments)
         except Exception:
             failed = True
             break
@@ -472,21 +695,15 @@ def execute_cron_install_spec(spec: Mapping[str, object], tool: CronTool) -> dic
 
     rollback_failures: list[str] = []
     for item in rollback:
-        if not isinstance(item, dict):
-            rollback_failures.append("invalid-rollback-entry")
-            continue
-        action = item.get("action")
+        action = cast(str, item["action"])
         try:
             if action == "remove":
                 rollback_index = item.get("operation_index")
                 if not isinstance(rollback_index, int) or rollback_index not in created:
                     continue
                 result = tool("remove", job_id=created[rollback_index])
-            elif action == "update" and isinstance(item.get("arguments"), dict):
-                result = tool("update", **item["arguments"])
             else:
-                rollback_failures.append(str(item.get("stable_name", "invalid")))
-                continue
+                result = tool("update", **cast(dict[str, object], item["arguments"]))
         except Exception:
             rollback_failures.append(str(item.get("stable_name", "unknown")))
             continue

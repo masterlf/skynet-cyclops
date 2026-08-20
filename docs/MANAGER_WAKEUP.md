@@ -441,11 +441,13 @@ It rejects task-scoped execution, an unknown/noncanonical manager profile, unsaf
 
 The explicit `--apply` staging transaction and its tool consumer MUST:
 
-1. obtain the complete tool-visible default-profile job snapshot immediately before planning;
+1. obtain the complete tool-visible default-profile job snapshot immediately before planning and
+   embed that snapshot plus its canonical hash in the private spec;
 2. reject stable-name conflicts for an install, or require one paused owned job and the exact prior
    private spec for each upgrade target;
-3. write scripts/config atomically under the explicit default profile home with mode `0700`
-   directories / `0600` files;
+3. hold the profile-local installer lock while writing scripts/config atomically under the explicit
+   default profile home with mode `0700` directories / `0600` files, restoring the exact prior
+   content and mode (or removing attempt-created files) if any write or readback fails;
 4. verify hashes and script path containment without opening Hermes cron storage;
 5. emit create/update operations consumed by the supported profile-local `cronjob` tool and pause
    every newly created job before proceeding;
@@ -467,7 +469,10 @@ On any verification failure, rollback in reverse order:
 5. fsync restored files/directories;
 6. report a redacted rollback result and remain observe-only.
 
-Rollback uses recorded identifiers and content hashes, not names alone. It never deletes an operator-owned job or file whose hash changed after the transaction began.
+Rollback uses snapshot-bound identifiers and content hashes, not names alone. The strict consumer
+rejects the complete spec before its first tool call if any profile, identity, argument, snapshot,
+operation, or rollback field is missing, extra, or inconsistent. It never deletes an operator-owned
+job or file whose hash changed after the transaction began.
 
 ## Projection and Dashboard contract
 
