@@ -40,6 +40,30 @@ def default_status_path() -> Path:
     return base / "skynet-cyclops" / "status.json"
 
 
+def canonical_private_hermes_home(path: Path) -> Path:
+    """Return an existing canonical owner-private default Hermes home."""
+    root = Path(path)
+    if not root.is_absolute() or root.name != ".hermes":
+        raise ValidationError("Hermes profile home is noncanonical")
+    owner = os.getuid() if hasattr(os, "getuid") else None
+    try:
+        if root.resolve(strict=True) != root:
+            raise ValidationError("Hermes profile home is unsafe")
+        info = root.lstat()
+        if (
+            root.is_symlink()
+            or not stat.S_ISDIR(info.st_mode)
+            or (owner is not None and info.st_uid != owner)
+            or stat.S_IMODE(info.st_mode) & 0o077
+        ):
+            raise ValidationError("Hermes profile home is unsafe")
+    except ValidationError:
+        raise
+    except OSError as exc:
+        raise ValidationError("Hermes profile home is unavailable") from exc
+    return root
+
+
 def load_config(path: str | os.PathLike[str]) -> Config:
     candidate = Path(path).expanduser()
     try:

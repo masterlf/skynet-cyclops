@@ -14,9 +14,10 @@ import pytest
 
 import skynet_cyclops.manager_install as manager_install
 from skynet_cyclops.errors import ValidationError
-from skynet_cyclops.manager import MANAGER_PROMPT
+from skynet_cyclops.manager import MANAGER_PROMPT, MANAGER_PROMPT_V0_2_2
 from skynet_cyclops.manager_install import (
     build_cron_install_spec,
+    build_cron_install_spec_v0_2_2,
     execute_cron_install_spec,
     stage_cron_install,
 )
@@ -33,7 +34,7 @@ def private_default_home(parent: Path) -> Path:
 
 def visible_job(name: str, job_id: str) -> dict[str, object]:
     courier = name == "cyclops-decision-courier"
-    prompt = "" if courier else MANAGER_PROMPT
+    prompt = "" if courier else MANAGER_PROMPT_V0_2_2
     return {
         "job_id": job_id,
         "name": name,
@@ -126,7 +127,9 @@ class FakeCronTool:
         self.fail_occurrence = fail_occurrence
         self.pause_state = pause_state
         self.full_prompts = {
-            str(job["job_id"]): "" if job["name"] == "cyclops-decision-courier" else MANAGER_PROMPT
+            str(job["job_id"]): (
+                "" if job["name"] == "cyclops-decision-courier" else MANAGER_PROMPT_V0_2_2
+            )
             for job in jobs or []
         }
 
@@ -204,7 +207,7 @@ def test_initial_spec_is_closed_machine_readable_and_rolls_back_new_ids() -> Non
         "rollback",
     }
     assert spec["protocol"] == "cyclops-cron-install/v1"
-    assert spec["release"] == "0.2.2"
+    assert spec["release"] == "0.3.0"
     assert spec["attempt_nonce"] == NONCE
     assert [item["action"] for item in spec["operations"]] == ["create", "create"]
     assert spec["operations"][0]["arguments"]["enabled_toolsets"] == ["no_mcp"]
@@ -215,7 +218,7 @@ def test_initial_spec_is_closed_machine_readable_and_rolls_back_new_ids() -> Non
 
 
 def test_upgrade_requires_exact_prior_spec_and_full_visible_snapshot() -> None:
-    installed = build_cron_install_spec(
+    installed = build_cron_install_spec_v0_2_2(
         profile="default",
         home_delivery="telegram",
         operation="install",
@@ -250,7 +253,7 @@ def test_upgrade_requires_exact_prior_spec_and_full_visible_snapshot() -> None:
 
 
 def test_upgrade_rollback_uses_update_with_prior_arguments() -> None:
-    installed = build_cron_install_spec(
+    installed = build_cron_install_spec_v0_2_2(
         profile="default",
         home_delivery="telegram",
         operation="install",
@@ -303,7 +306,7 @@ def test_executor_removes_only_created_jobs_after_partial_install_failure() -> N
 
 
 def test_executor_restores_upgrade_with_update_until_converged() -> None:
-    installed = build_cron_install_spec(
+    installed = build_cron_install_spec_v0_2_2(
         profile="default",
         home_delivery="telegram",
         operation="install",
@@ -449,7 +452,7 @@ def test_snapshot_rejects_bad_and_duplicate_identities() -> None:
 
 
 def test_upgrade_rejects_incompatible_prior_spec_and_unpaused_job() -> None:
-    installed = build_cron_install_spec(
+    installed = build_cron_install_spec_v0_2_2(
         profile="default",
         home_delivery="telegram",
         operation="install",
@@ -665,7 +668,7 @@ def test_tool_result_and_verification_boundaries_fail_closed() -> None:
     ],
 )
 def test_upgrade_rejects_malformed_prior_spec(mutate: Any) -> None:
-    installed = build_cron_install_spec(
+    installed = build_cron_install_spec_v0_2_2(
         profile="default",
         home_delivery="telegram",
         operation="install",
@@ -690,7 +693,7 @@ def test_upgrade_rejects_malformed_prior_spec(mutate: Any) -> None:
 
 @pytest.mark.parametrize("operations", [[None, None], [{}, None]])
 def test_upgrade_rejects_non_mapping_prior_operations(operations: list[object]) -> None:
-    installed = build_cron_install_spec(
+    installed = build_cron_install_spec_v0_2_2(
         profile="default",
         home_delivery="telegram",
         operation="install",
@@ -996,7 +999,7 @@ def test_executor_rejects_semantic_tampering_before_tool_call(tamper: Any) -> No
 
 
 def test_executor_rejects_unrelated_upgrade_target_before_tool_call() -> None:
-    installed = build_cron_install_spec(
+    installed = build_cron_install_spec_v0_2_2(
         profile="default",
         home_delivery="telegram",
         operation="install",
@@ -1029,7 +1032,7 @@ def test_executor_rejects_unrelated_upgrade_target_before_tool_call() -> None:
 
 
 def test_executor_binds_consistently_tampered_upgrade_ids_to_snapshot() -> None:
-    installed = build_cron_install_spec(
+    installed = build_cron_install_spec_v0_2_2(
         profile="default",
         home_delivery="telegram",
         operation="install",

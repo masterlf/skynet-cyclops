@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "skynet-cyclops"
-version = "0.2.2"
+version = "0.3.0"
 description = "Deterministic, token-efficient supervision for Hermes Kanban workflows"
 readme = "README.md"
 requires-python = ">=3.11"

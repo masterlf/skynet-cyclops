@@ -22,6 +22,42 @@ class Collector(Protocol):
     def collect(self, board: str, task_ids: list[str]) -> dict[str, object]: ...
 
 
+def incident_observations(
+    manifest: Manifest, bindings: dict[str, str], raw_collection: dict[str, object]
+) -> list[IncidentObservation]:
+    """Derive authoritative typed incident observations without mutating the ledger."""
+    collection = Collection.from_mapping(raw_collection)
+    mission_state = derive_mission_state(manifest, bindings, collection)
+    observations: list[IncidentObservation] = []
+    for phase in mission_state.phases:
+        if phase.state not in {"unknown", "failed", "blocked"}:
+            continue
+        typed_facts = {
+            "expected_state": "done",
+            "kind": f"phase_{phase.state}",
+            "mission_id": manifest.mission.id,
+            "observed_state": phase.state,
+            "phase_key": phase.key,
+            "subject_task_id": phase.task_id,
+        }
+        observations.append(
+            IncidentObservation(
+                mission_id=manifest.mission.id,
+                phase_key=phase.key,
+                kind=f"phase_{phase.state}",
+                subject_task_id=phase.task_id,
+                subject_run_id=None,
+                severity="critical" if phase.state in {"unknown", "failed"} else "warning",
+                observation_sha256=hashlib.sha256(
+                    json.dumps(typed_facts, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest(),
+                expected_state="done",
+                observed_state=phase.state,
+            )
+        )
+    return observations
+
+
 def _base_projection(
     now: float,
     tick_seq: int,
@@ -138,32 +174,7 @@ def run_tick(
         raw_collection = collector.collect(manifest.mission.board, list(bindings.values()))
         collection = Collection.from_mapping(raw_collection)
         mission_state = derive_mission_state(manifest, bindings, collection)
-        observations: list[IncidentObservation] = []
-        for phase in mission_state.phases:
-            if phase.state in {"unknown", "failed", "blocked"}:
-                typed_facts = {
-                    "expected_state": "done",
-                    "kind": f"phase_{phase.state}",
-                    "mission_id": manifest.mission.id,
-                    "observed_state": phase.state,
-                    "phase_key": phase.key,
-                    "subject_task_id": phase.task_id,
-                }
-                observations.append(
-                    IncidentObservation(
-                        mission_id=manifest.mission.id,
-                        phase_key=phase.key,
-                        kind=f"phase_{phase.state}",
-                        subject_task_id=phase.task_id,
-                        subject_run_id=None,
-                        severity="critical" if phase.state in {"unknown", "failed"} else "warning",
-                        observation_sha256=hashlib.sha256(
-                            json.dumps(typed_facts, sort_keys=True, separators=(",", ":")).encode()
-                        ).hexdigest(),
-                        expected_state="done",
-                        observed_state=phase.state,
-                    )
-                )
+        observations = incident_observations(manifest, bindings, raw_collection)
         ledger.observe_manager_incidents(
             observations,
             mission_id=manifest.mission.id,

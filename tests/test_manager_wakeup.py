@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -12,9 +13,11 @@ from pathlib import Path
 
 import pytest
 
+import skynet_cyclops.ledger as ledger_module
 import skynet_cyclops.manager as manager_module
 from skynet_cyclops.activation import ActivationVerdict
 from skynet_cyclops.errors import LedgerError, ValidationError
+from skynet_cyclops.hermes_results import CronCollection, CronResult, CronRun
 from skynet_cyclops.ledger import Ledger
 from skynet_cyclops.manager import (
     MANAGER_PROMPT,
@@ -787,10 +790,445 @@ def test_generation_recurrence_fences_old_ack(tmp_path: Path) -> None:
             )
 
 
-def test_ledger_schema_v2_contains_private_lifecycle_tables(tmp_path: Path) -> None:
+def _runtime_result(response: str, *, outcome: str = "suppressed") -> CronResult:
+    return CronResult(
+        execution_id="exec-runtime",
+        job_id="cyclops-manager-router",
+        status="completed",
+        claimed_at=100.0,
+        started_at=100.5,
+        finished_at=102.0,
+        final_response=response,
+        final_response_sha256=hashlib.sha256(response.encode()).hexdigest(),
+        final_response_bytes=len(response.encode()),
+        delivery_outcome=outcome,
+    )
+
+
+def _runtime_collection(result: CronResult) -> CronCollection:
+    run = CronRun(
+        result.execution_id,
+        result.job_id,
+        "completed",
+        result.claimed_at,
+        result.started_at,
+        result.finished_at,
+        True,
+    )
+    return CronCollection((run,), (result,), True)
+
+
+def test_router_imports_exact_runtime_result_before_any_new_lease(tmp_path: Path) -> None:
+    with create_ledger(tmp_path / "ledger.db") as ledger:
+        ledger.observe_manager_incidents([observation()], tick_seq=1, now=99.0)
+        ledger.observe_manager_incidents([observation()], tick_seq=2, now=100.0)
+        context = manager_router_gate(
+            ledger,
+            now=101.0,
+            result_collection=lambda _job, _lease: CronCollection((), (), True),
+        )["context"]
+        result = _runtime_result(_ack(context))
+        calls: list[str] = []
+        assert manager_router_gate(
+            ledger,
+            now=103.0,
+            result_collection=lambda _job, _lease: (
+                calls.append("collect") or _runtime_collection(result)
+            ),
+            current_incident=lambda _incident: observation(),
+        ) == {"wakeAgent": False}
+        assert calls == ["collect"]
+        incident = ledger.manager_incidents()[0]
+        assert incident["lifecycle"] == "human_required"
+        assert incident["notification_state"] == "pending"
+        assert ledger.manager_budget("synthetic-release", "1970-01-01") == 1
+
+
+def test_router_cleared_runtime_result_resolves_without_notification(tmp_path: Path) -> None:
+    with create_ledger(tmp_path / "ledger.db") as ledger:
+        ledger.observe_manager_incidents([observation()], tick_seq=1, now=99.0)
+        ledger.observe_manager_incidents([observation()], tick_seq=2, now=100.0)
+        context = manager_router_gate(
+            ledger,
+            now=101.0,
+            result_collection=lambda _job, _lease: CronCollection((), (), True),
+        )["context"]
+        result = _runtime_result(_ack(context))
+        manager_router_gate(
+            ledger,
+            now=103.0,
+            result_collection=lambda _job, _lease: _runtime_collection(result),
+            current_incident=lambda _incident: None,
+        )
+        incident = ledger.manager_incidents()[0]
+        assert incident["lifecycle"] == "resolved"
+        assert incident["notification_state"] == "none"
+
+
+def test_courier_marks_sent_only_for_exact_delivered_execution(tmp_path: Path) -> None:
+    with create_ledger(tmp_path / "ledger.db") as ledger:
+        ledger.observe_manager_incidents([observation()], tick_seq=1, now=99.0)
+        ledger.observe_manager_incidents([observation()], tick_seq=2, now=100.0)
+        context = manager_router_gate(ledger, now=101.0)["context"]
+        import_manager_ack(
+            ledger,
+            _ack(context),
+            cron_execution_id="exec-manager",
+            condition_persists=lambda _incident: True,
+            now=102.0,
+        )
+        packet = notification_courier(
+            ledger,
+            now=103.0,
+            result_collection=lambda _job, _lease: CronCollection((), (), True),
+            environment={},
+        )
+        result = CronResult(
+            execution_id="exec-courier",
+            job_id="cyclops-decision-courier",
+            status="completed",
+            claimed_at=102.0,
+            started_at=102.5,
+            finished_at=104.0,
+            final_response=packet,
+            final_response_sha256=hashlib.sha256(packet.encode()).hexdigest(),
+            final_response_bytes=len(packet.encode()),
+            delivery_outcome="delivered",
+        )
+        assert (
+            notification_courier(
+                ledger,
+                now=105.0,
+                result_collection=lambda _job, _lease: _runtime_collection(
+                    replace(result, job_id="cyclops-manager-router")
+                ),
+                courier_job_id="cyclops-decision-courier",
+                environment={},
+            )
+            == ""
+        )
+        assert ledger.manager_incidents()[0]["notification_state"] == "leased"
+        courier_run = CronRun(
+            result.execution_id,
+            result.job_id,
+            "completed",
+            result.claimed_at,
+            result.started_at,
+            result.finished_at,
+            True,
+        )
+        assert (
+            notification_courier(
+                ledger,
+                now=105.0,
+                result_collection=lambda _job, _lease: CronCollection(
+                    (courier_run,), (result,), True
+                ),
+                environment={},
+            )
+            == ""
+        )
+        assert ledger.manager_incidents()[0]["notification_state"] == "sent"
+        assert (
+            notification_courier(
+                ledger,
+                now=106.0,
+                result_collection=lambda _job, _lease: CronCollection(
+                    (courier_run,), (result,), True
+                ),
+                environment={},
+            )
+            == ""
+        )
+
+
+def test_runtime_collectors_fail_closed_on_ambiguity_drift_and_activation(tmp_path: Path) -> None:
+    with create_ledger(tmp_path / "router.db") as ledger:
+        ledger.observe_manager_incidents([observation()], tick_seq=1, now=99.0)
+        ledger.observe_manager_incidents([observation()], tick_seq=2, now=100.0)
+        context = manager_router_gate(
+            ledger,
+            now=101.0,
+            result_collection=lambda _job, _lease: CronCollection((), (), True),
+        )["context"]
+        result = _runtime_result(_ack(context))
+        assert manager_router_gate(
+            ledger,
+            now=103.0,
+            result_collection=lambda _job, _lease: CronCollection((), (), False),
+            current_incident=lambda _incident: observation(),
+        ) == {"wakeAgent": False}
+        assert manager_router_gate(
+            ledger,
+            now=103.0,
+            result_collection=lambda _job, _lease: object(),  # type: ignore[arg-type,return-value]
+            current_incident=lambda _incident: observation(),
+        ) == {"wakeAgent": False}
+
+        def broken_collection(_job: str, _lease: float | None) -> CronCollection:
+            raise RuntimeError("synthetic private failure")
+
+        assert manager_router_gate(
+            ledger,
+            now=103.0,
+            result_collection=broken_collection,
+            current_incident=lambda _incident: observation(),
+        ) == {"wakeAgent": False}
+        assert manager_router_gate(
+            ledger,
+            now=103.0,
+            result_collection=lambda _job, _lease: CronCollection(
+                _runtime_collection(result).runs,
+                (result, replace(result, execution_id="exec-2")),
+                True,
+            ),
+            current_incident=lambda _incident: observation(),
+        ) == {"wakeAgent": False}
+        assert manager_router_gate(
+            ledger,
+            now=103.0,
+            result_collection=lambda _job, _lease: _runtime_collection(result),
+            current_incident=lambda _incident: observation(fingerprint="f" * 64),
+        ) == {"wakeAgent": False}
+        attempt = ledger.manager_attempt(str(context["attempt_id"]))
+        assert attempt is not None and attempt["state"] == "superseded"
+
+    with create_ledger(tmp_path / "malformed-router.db") as ledger:
+        ledger.observe_manager_incidents([observation()], tick_seq=1, now=99.0)
+        ledger.observe_manager_incidents([observation()], tick_seq=2, now=100.0)
+        context = manager_router_gate(
+            ledger,
+            now=101.0,
+            result_collection=lambda _job, _lease: CronCollection((), (), True),
+        )["context"]
+        assert isinstance(context, dict)
+        malformed = _runtime_result("not-json")
+        assert manager_router_gate(
+            ledger,
+            now=103.0,
+            result_collection=lambda _job, _lease: _runtime_collection(malformed),
+            current_incident=lambda _incident: observation(),
+        ) == {"wakeAgent": False}
+        attempt = ledger.manager_attempt(str(context["attempt_id"]))
+        assert attempt is not None and attempt["state"] == "leased"
+
+        valid = _runtime_result(_ack(context))
+        assert manager_router_gate(
+            ledger,
+            now=103.0,
+            result_collection=lambda _job, _lease: _runtime_collection(valid),
+        ) == {"wakeAgent": False}
+        attempt = ledger.manager_attempt(str(context["attempt_id"]))
+        assert attempt is not None and attempt["state"] == "leased"
+
+    with create_ledger(tmp_path / "courier.db") as ledger:
+
+        def broken_activation() -> ActivationVerdict:
+            raise RuntimeError("synthetic private failure")
+
+        assert (
+            notification_courier(
+                ledger, now=1.0, environment={}, activation_check=broken_activation
+            )
+            == ""
+        )
+        assert (
+            notification_courier(
+                ledger,
+                now=1.0,
+                environment={},
+                activation_check=lambda: ActivationVerdict("disabled", "supported", False),
+                result_collection=lambda _job, _lease: CronCollection((), (), True),
+            )
+            == ""
+        )
+        assert (
+            notification_courier(
+                ledger,
+                now=1.0,
+                environment={"HERMES_KANBAN_TASK": "synthetic"},
+            )
+            == ""
+        )
+
+
+def test_courier_failed_outcome_retries_same_packet_after_backoff(tmp_path: Path) -> None:
+    with create_ledger(tmp_path / "ledger.db") as ledger:
+        ledger.observe_manager_incidents([observation()], tick_seq=1, now=99.0)
+        ledger.observe_manager_incidents([observation()], tick_seq=2, now=100.0)
+        context = manager_router_gate(ledger, now=101.0)["context"]
+        import_manager_ack(
+            ledger,
+            _ack(context),
+            cron_execution_id="exec-manager",
+            condition_persists=lambda _incident: True,
+            now=102.0,
+        )
+        packet = notification_courier(
+            ledger,
+            now=103.0,
+            environment={},
+            result_collection=lambda _job, _lease: CronCollection((), (), True),
+        )
+        failed = CronResult(
+            execution_id="exec-failed",
+            job_id="cyclops-decision-courier",
+            status="completed",
+            claimed_at=102.0,
+            started_at=102.5,
+            finished_at=104.0,
+            final_response=packet,
+            final_response_sha256=hashlib.sha256(packet.encode()).hexdigest(),
+            final_response_bytes=len(packet.encode()),
+            delivery_outcome="failed",
+        )
+        run = CronRun(
+            failed.execution_id,
+            failed.job_id,
+            failed.status,
+            failed.claimed_at,
+            failed.started_at,
+            failed.finished_at,
+            True,
+        )
+        assert (
+            notification_courier(
+                ledger,
+                now=105.0,
+                environment={},
+                result_collection=lambda _job, _lease: CronCollection((run,), (failed,), True),
+            )
+            == ""
+        )
+        assert ledger.manager_incidents()[0]["notification_state"] == "pending"
+        assert (
+            notification_courier(
+                ledger,
+                now=404.0,
+                environment={},
+                result_collection=lambda _job, _lease: CronCollection((), (), True),
+            )
+            == ""
+        )
+        retry = notification_courier(
+            ledger,
+            now=405.0,
+            environment={},
+            result_collection=lambda _job, _lease: CronCollection((), (), True),
+        )
+        assert retry == packet
+
+
+def test_courier_complete_window_classifies_missing_expired_result(tmp_path: Path) -> None:
+    with create_ledger(tmp_path / "ledger.db") as ledger:
+        ledger.observe_manager_incidents([observation()], tick_seq=1, now=99.0)
+        ledger.observe_manager_incidents([observation()], tick_seq=2, now=100.0)
+        context = manager_router_gate(ledger, now=101.0)["context"]
+        import_manager_ack(
+            ledger,
+            _ack(context),
+            cron_execution_id="exec-manager",
+            condition_persists=lambda _incident: True,
+            now=102.0,
+        )
+        packet = notification_courier(
+            ledger,
+            now=103.0,
+            environment={},
+            result_collection=lambda _job, _lease: CronCollection((), (), True),
+        )
+        assert packet
+        assert (
+            notification_courier(
+                ledger,
+                now=404.0,
+                environment={},
+                result_collection=lambda _job, _lease: CronCollection((), (), True),
+            )
+            == ""
+        )
+        assert ledger.manager_incidents()[0]["notification_state"] == "pending"
+        retry = notification_courier(
+            ledger,
+            now=704.0,
+            environment={},
+            result_collection=lambda _job, _lease: CronCollection((), (), True),
+        )
+        assert retry == packet
+
+
+def test_courier_malformed_adapter_windows_are_silent_and_do_not_mutate_intent(
+    tmp_path: Path,
+) -> None:
+    with create_ledger(tmp_path / "malformed-courier.db") as ledger:
+        ledger.observe_manager_incidents([observation()], tick_seq=1, now=99.0)
+        ledger.observe_manager_incidents([observation()], tick_seq=2, now=100.0)
+        context = manager_router_gate(ledger, now=101.0)["context"]
+        assert isinstance(context, dict)
+        import_manager_ack(
+            ledger,
+            _ack(context),
+            cron_execution_id="exec-manager",
+            condition_persists=lambda _incident: True,
+            now=102.0,
+        )
+        packet = notification_courier(
+            ledger,
+            now=103.0,
+            environment={},
+            result_collection=lambda _job, _lease: CronCollection((), (), True),
+        )
+
+        def broken_collection(_job: str, _lease: float | None) -> CronCollection:
+            raise ValidationError("synthetic malformed adapter")
+
+        for collection in (
+            lambda _job, _lease: object(),
+            lambda _job, _lease: CronCollection((), (), False),
+            broken_collection,
+        ):
+            assert (
+                notification_courier(
+                    ledger,
+                    now=104.0,
+                    environment={},
+                    result_collection=collection,  # type: ignore[arg-type]
+                )
+                == ""
+            )
+            assert ledger.manager_incidents()[0]["notification_state"] == "leased"
+
+        result = CronResult(
+            execution_id="exec-courier",
+            job_id="cyclops-decision-courier",
+            status="completed",
+            claimed_at=102.0,
+            started_at=102.5,
+            finished_at=104.0,
+            final_response=packet,
+            final_response_sha256=hashlib.sha256(packet.encode()).hexdigest(),
+            final_response_bytes=len(packet.encode()),
+            delivery_outcome="delivered",
+        )
+        duplicate = replace(result, execution_id="exec-courier-duplicate")
+        assert (
+            notification_courier(
+                ledger,
+                now=105.0,
+                environment={},
+                result_collection=lambda _job, _lease: CronCollection(
+                    (), (result, duplicate), True
+                ),
+            )
+            == ""
+        )
+        assert ledger.manager_incidents()[0]["notification_state"] == "leased"
+
+
+def test_ledger_schema_v3_contains_private_lifecycle_tables(tmp_path: Path) -> None:
     path = tmp_path / "ledger.db"
     with create_ledger(path) as ledger:
-        assert ledger.schema_version == 2
+        assert ledger.schema_version == 3
     connection = sqlite3.connect(path)
     names = {
         row[0]
@@ -839,13 +1277,13 @@ def test_schema_v1_migration_keeps_backup_and_preserves_incident(tmp_path: Path)
     assert backup_connection.execute("SELECT schema_version FROM meta").fetchone() == (1,)
     backup_connection.close()
     with Ledger.open(path) as ledger:
-        assert ledger.schema_version == 2
+        assert ledger.schema_version == 3
         incident = ledger.manager_incident("legacy-incident", 1)
         assert incident is not None
         assert incident["lifecycle"] == "detected"
 
 
-def test_schema_migration_rejects_v2_without_creating_backup(tmp_path: Path) -> None:
+def test_schema_v1_migration_rejects_v3_without_creating_backup(tmp_path: Path) -> None:
     path = tmp_path / "ledger.db"
     backup = tmp_path / "must-not-exist.db"
     with Ledger.create(path):
@@ -854,4 +1292,38 @@ def test_schema_migration_rejects_v2_without_creating_backup(tmp_path: Path) -> 
         Ledger.migrate_v1(path, backup)
     assert not backup.exists()
     with Ledger.open(path) as ledger:
-        assert ledger.schema_version == 2
+        assert ledger.schema_version == 3
+
+
+def test_schema_v2_migration_keeps_exact_backup_and_adds_delivery_fences(tmp_path: Path) -> None:
+    path = tmp_path / "ledger-v2.db"
+    backup = tmp_path / "ledger-v2.backup.db"
+    legacy_schema = ledger_module._SCHEMA.replace(
+        "    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count BETWEEN 0 AND 2),\n"
+        "    lease_acquired_at REAL,\n"
+        "    lease_expires_at REAL,\n"
+        "    next_attempt_at REAL NOT NULL DEFAULT 0,\n"
+        "    last_outcome TEXT CHECK (last_outcome IN ('delivered', 'failed', "
+        "'not_configured', 'suppressed', 'malformed')),\n"
+        "    courier_execution_id TEXT UNIQUE,\n",
+        "    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count BETWEEN 0 AND 2),\n"
+        "    lease_expires_at REAL,\n"
+        "    courier_execution_id TEXT,\n",
+    ).replace(
+        "INSERT INTO meta(singleton, schema_version, mode) VALUES (1, 3, 'observe');",
+        "INSERT INTO meta(singleton, schema_version, mode) VALUES (1, 2, 'observe');",
+    )
+    connection = sqlite3.connect(path)
+    connection.executescript(legacy_schema)
+    connection.close()
+    os.chmod(path, 0o600)
+    Ledger.migrate_v2(path, backup)
+    backup_connection = sqlite3.connect(backup)
+    assert backup_connection.execute("SELECT schema_version FROM meta").fetchone() == (2,)
+    backup_connection.close()
+    with Ledger.open(path) as ledger:
+        assert ledger.schema_version == 3
+    migrated = sqlite3.connect(path)
+    columns = {row[1] for row in migrated.execute("PRAGMA table_info(notification_intents)")}
+    migrated.close()
+    assert {"lease_acquired_at", "next_attempt_at", "last_outcome"} <= columns

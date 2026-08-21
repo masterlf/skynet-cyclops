@@ -21,10 +21,11 @@ from pathlib import Path
 from typing import cast
 
 from .errors import ValidationError
-from .manager import MANAGER_PROMPT
+from .manager import MANAGER_PROMPT, MANAGER_PROMPT_V0_2_2
 
 _PROTOCOL = "cyclops-cron-install/v1"
-_RELEASE = "0.2.2"
+_RELEASE = "0.3.0"
+_PRIOR_RELEASE = "0.2.2"
 _STABLE_NAMES = ("cyclops-manager-router", "cyclops-decision-courier")
 _HEX = frozenset("0123456789abcdef")
 _SPEC_KEYS = frozenset(
@@ -205,11 +206,13 @@ def _scripts(nonce: str) -> tuple[dict[str, str], dict[str, str]]:
     )
 
 
-def _job_arguments(home_delivery: str) -> tuple[dict[str, object], dict[str, object]]:
+def _job_arguments(
+    home_delivery: str, *, manager_prompt: str = MANAGER_PROMPT
+) -> tuple[dict[str, object], dict[str, object]]:
     router = {
         "name": _STABLE_NAMES[0],
         "schedule": "every 2m",
-        "prompt": MANAGER_PROMPT,
+        "prompt": manager_prompt,
         "repeat": 0,
         "deliver": "local",
         "skills": [],
@@ -238,7 +241,10 @@ def _job_arguments(home_delivery: str) -> tuple[dict[str, object], dict[str, obj
 def _validate_previous_spec(value: object) -> dict[str, object]:
     if not isinstance(value, dict) or value.get("protocol") != _PROTOCOL:
         raise ValidationError("upgrade requires the exact prior spec")
-    if value.get("release") != _RELEASE or value.get("operation") not in {"install", "upgrade"}:
+    if value.get("release") != _PRIOR_RELEASE or value.get("operation") not in {
+        "install",
+        "upgrade",
+    }:
         raise ValidationError("upgrade prior spec is incompatible")
     operations = value.get("operations")
     if not isinstance(operations, list) or len(operations) != 2:
@@ -251,7 +257,9 @@ def _validate_previous_spec(value: object) -> dict[str, object]:
     if any(not isinstance(item.get("arguments"), dict) for item in typed_operations):
         raise ValidationError("upgrade prior spec arguments are invalid")
     try:
-        return _validate_cron_install_spec(value)
+        return _validate_cron_install_spec(
+            value, expected_release=_PRIOR_RELEASE, manager_prompt=MANAGER_PROMPT_V0_2_2
+        )
     except ValidationError as exc:
         raise ValidationError("upgrade requires the exact prior spec") from exc
 
@@ -362,14 +370,19 @@ def build_cron_install_spec(
     return spec
 
 
-def _validate_cron_install_spec(value: object) -> dict[str, object]:
+def _validate_cron_install_spec(
+    value: object,
+    *,
+    expected_release: str = _RELEASE,
+    manager_prompt: str = MANAGER_PROMPT,
+) -> dict[str, object]:
     """Validate the complete closed mutation contract before any side effect."""
     try:
         if not isinstance(value, dict) or set(value) != _SPEC_KEYS:
             raise ValidationError("cron install execution spec is invalid")
         if (
             value.get("protocol") != _PROTOCOL
-            or value.get("release") != _RELEASE
+            or value.get("release") != expected_release
             or value.get("profile") != "default"
             or value.get("verification") != _verification()
         ):
@@ -410,7 +423,9 @@ def _validate_cron_install_spec(value: object) -> dict[str, object]:
         courier_arguments = typed_operations[1].get("arguments")
         if not isinstance(courier_arguments, dict):
             raise ValidationError("cron install execution spec is invalid")
-        current_arguments = _job_arguments(_home_delivery(courier_arguments.get("deliver")))
+        current_arguments = _job_arguments(
+            _home_delivery(courier_arguments.get("deliver")), manager_prompt=manager_prompt
+        )
         expected_rollback: list[dict[str, object]]
 
         if operation == "install":
@@ -479,7 +494,10 @@ def _validate_cron_install_spec(value: object) -> dict[str, object]:
             prior_courier_arguments = typed_rollback[0].get("arguments")
             if not isinstance(prior_courier_arguments, dict):
                 raise ValidationError("cron install execution spec is invalid")
-            prior_arguments = _job_arguments(_home_delivery(prior_courier_arguments.get("deliver")))
+            prior_arguments = _job_arguments(
+                _home_delivery(prior_courier_arguments.get("deliver")),
+                manager_prompt=MANAGER_PROMPT_V0_2_2,
+            )
             expected_rollback = [
                 {
                     "action": "update",
@@ -496,6 +514,34 @@ def _validate_cron_install_spec(value: object) -> dict[str, object]:
         return value
     except (KeyError, TypeError, ValueError) as exc:
         raise ValidationError("cron install execution spec is invalid") from exc
+
+
+def build_cron_install_spec_v0_2_2(
+    *,
+    home_delivery: str,
+    attempt_nonce: str,
+    profile: str = "default",
+    operation: str = "install",
+    visible_jobs: Sequence[Mapping[str, object]] = (),
+) -> dict[str, object]:
+    """Generate the immutable exact prior install contract accepted for v0.3 upgrade."""
+    if profile != "default" or operation != "install" or visible_jobs:
+        raise ValidationError("prior install generator accepts only the exact v0.2.2 baseline")
+    spec = build_cron_install_spec(
+        profile="default",
+        home_delivery=home_delivery,
+        operation="install",
+        visible_jobs=[],
+        attempt_nonce=attempt_nonce,
+    )
+    spec["release"] = _PRIOR_RELEASE
+    operations = cast(list[dict[str, object]], spec["operations"])
+    router_arguments = cast(dict[str, object], operations[0]["arguments"])
+    router_arguments["prompt"] = MANAGER_PROMPT_V0_2_2
+    _validate_cron_install_spec(
+        spec, expected_release=_PRIOR_RELEASE, manager_prompt=MANAGER_PROMPT_V0_2_2
+    )
+    return spec
 
 
 def _private_directory(path: Path) -> None:
@@ -928,6 +974,13 @@ def execute_cron_install_spec(
         candidate_reader = getattr(tool, "read_full_job", None)
         if callable(candidate_reader):
             full_job_reader = cast(FullJobReader, candidate_reader)
+    if operation == "upgrade" and not _readback_matches(
+        tool,
+        expected,
+        full_job_reader=full_job_reader,
+        expected_prompts=expected_prompts,
+    ):
+        raise ValidationError("upgrade live definitions do not match the exact prior release")
     created: dict[int, str] = {}
     failed = False
     for index, item in enumerate(operations):

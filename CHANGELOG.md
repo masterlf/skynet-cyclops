@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented here. The project follows Semantic Versioning after public releases.
 
+## [0.3.0] - 2026-08-21
+
+- Add a bounded fixed-argv Hermes cron runs/result adapter with explicit canonical `HERMES_HOME`.
+- Import exact manager ACK results before lease reconciliation; current incidents become
+  `human_required` with one atomic intent, while cleared results resolve without notification.
+- Import exact courier delivery results and mark notifications sent only for `delivered` outcomes;
+  failures remain bounded same-packet retries.
+- Add exact paused v0.2.2 to v0.3.0 manager-job upgrade validation and no-delete rollback.
+
 ## [0.2.2] - 2026-08-20
 
 ### Fixed

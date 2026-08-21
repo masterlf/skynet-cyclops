@@ -14,7 +14,6 @@ from pathlib import Path
 
 from .activation import (
     ActivationInputs,
-    ActivationVerdict,
     activate_manager,
     activation_verdict,
     deactivate_manager,
@@ -24,12 +23,19 @@ from .adapter import HermesAdapter, ReadOnlyCollector
 from .bootstrap import apply_bootstrap, plan_bootstrap
 from .config import Config, default_config_path, default_ledger_path, load_config
 from .errors import AdapterError, CyclopsError, LedgerError, ProjectionError, ValidationError
+from .hermes_results import HermesCronResultAdapter
 from .ledger import Ledger
-from .manager import manager_router_gate, notification_courier
+from .manager import (
+    IncidentObservation,
+    manager_router_gate,
+    manager_scope_denied,
+    notification_courier,
+    stable_incident_id,
+)
 from .manager_install import build_cron_install_spec, stage_cron_install
 from .manifest import canonical_manifest_hash, load_manifest
 from .projection import read_projection
-from .tick import run_tick
+from .tick import incident_observations, run_tick
 
 
 class ExitCode(IntEnum):
@@ -91,6 +97,12 @@ def _json(value: object) -> None:
     print(json.dumps(value, sort_keys=True, separators=(",", ":")))
 
 
+def _manager_negative_gate(role: str) -> ExitCode:
+    if role == "router":
+        _json({"wakeAgent": False})
+    return ExitCode.OK
+
+
 def _utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -133,7 +145,11 @@ def _bootstrap(args: argparse.Namespace) -> ExitCode:
         _json({"mode": "dry-run", "plan": [item.to_dict() for item in plan]})
         return ExitCode.OK
     config = load_config(args.config)
-    adapter = HermesAdapter(binary=config.hermes_binary)
+    adapter = HermesAdapter(
+        binary=config.hermes_binary,
+        hermes_home=config.hermes_home,
+        environment=os.environ,
+    )
     ledger_path = config.ledger_path if config.ledger_path else default_ledger_path()
     try:
         ledger = Ledger.open(ledger_path)
@@ -179,6 +195,8 @@ def _execute(args: argparse.Namespace) -> ExitCode:
                 stage_cron_install(spec, Path(args.hermes_home))
             _json(spec)
             return ExitCode.OK
+        if args.manager_command in {"router", "courier"} and manager_scope_denied(os.environ):
+            return _manager_negative_gate(args.manager_command)
         config = load_config(args.config)
         activation_path, evidence_path, profile_home = _activation_paths(
             config,
@@ -214,28 +232,72 @@ def _execute(args: argparse.Namespace) -> ExitCode:
             )
             return ExitCode.OK
 
-        def current_activation() -> ActivationVerdict:
-            return activation_verdict(
-                load_activation_inputs(
-                    activation_path=activation_path,
-                    hermes_home=profile_home,
-                    evidence_path=evidence_path,
-                    hermes_binary=config.hermes_binary,
-                )
+        try:
+            inputs = load_activation_inputs(
+                activation_path=activation_path,
+                hermes_home=profile_home,
+                evidence_path=evidence_path,
+                hermes_binary=config.hermes_binary,
             )
+            verdict = activation_verdict(inputs)
+            if not verdict.wake_enabled:
+                return _manager_negative_gate(args.manager_command)
+            role = "router" if args.manager_command == "router" else "courier"
+            job_id = str(inputs.jobs[role]["job_id"])
+            result_adapter = HermesCronResultAdapter(
+                binary=config.hermes_binary,
+                hermes_home=profile_home,
+                environment=os.environ,
+            )
+        except (AdapterError, ValidationError, AttributeError, KeyError, TypeError):
+            return _manager_negative_gate(args.manager_command)
 
         with Ledger.open(config.ledger_path) as ledger:
+
+            def current_incident(stored: dict[str, object]) -> IncidentObservation | None:
+                manifest = load_manifest(config.manifest_path)
+                bindings = ledger.bindings(str(stored["mission_id"]))
+                raw = ReadOnlyCollector(
+                    HermesAdapter(
+                        binary=config.hermes_binary,
+                        hermes_home=profile_home,
+                        environment=os.environ,
+                    )
+                ).collect(manifest.mission.board, list(bindings.values()))
+                matches = [
+                    item
+                    for item in incident_observations(manifest, bindings, raw)
+                    if stable_incident_id(item) == stored["incident_id"]
+                ]
+                if len(matches) > 1:
+                    raise ValidationError("manager incident revalidation is ambiguous")
+                return None if not matches else matches[0]
+
             if args.manager_command == "router":
                 _json(
                     manager_router_gate(
                         ledger,
                         now=time.time(),
                         environment=os.environ,
-                        activation_check=current_activation,
+                        activation_check=lambda: verdict,
+                        router_job_id=job_id,
+                        result_collection=lambda exact_job, acquired: result_adapter.collect(
+                            exact_job, lease_acquired_at=acquired
+                        ),
+                        current_incident=current_incident,
                     )
                 )
             else:
-                output = notification_courier(ledger, now=time.time())
+                output = notification_courier(
+                    ledger,
+                    now=time.time(),
+                    environment=os.environ,
+                    activation_check=lambda: verdict,
+                    courier_job_id=job_id,
+                    result_collection=lambda exact_job, acquired: result_adapter.collect(
+                        exact_job, lease_acquired_at=acquired
+                    ),
+                )
                 if output:
                     print(output)
         return ExitCode.OK
@@ -247,7 +309,13 @@ def _execute(args: argparse.Namespace) -> ExitCode:
             manifest,
             config.ledger_path,
             config.status_path,
-            ReadOnlyCollector(HermesAdapter(binary=config.hermes_binary)),
+            ReadOnlyCollector(
+                HermesAdapter(
+                    binary=config.hermes_binary,
+                    hermes_home=profile_home,
+                    environment=os.environ,
+                )
+            ),
             debounce_ticks=config.incident_debounce_ticks,
             activation_check=lambda: activation_verdict(
                 load_activation_inputs(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,7 @@ import yaml
 from conftest import manifest_data, write_manifest
 
 from skynet_cyclops import cli
+from skynet_cyclops import manager as manager_module
 from skynet_cyclops.activation import ActivationVerdict
 from skynet_cyclops.cli import ExitCode, main
 from skynet_cyclops.config import default_ledger_path, default_status_path, load_config
@@ -21,6 +23,7 @@ from skynet_cyclops.errors import (
     ValidationError,
 )
 from skynet_cyclops.ledger import Ledger
+from skynet_cyclops.manager import IncidentObservation
 from skynet_cyclops.manifest import canonical_manifest_hash, parse_manifest
 from skynet_cyclops.tick import run_tick
 
@@ -255,7 +258,7 @@ def test_cli_manager_install_dry_run_emits_spec_and_apply_only_stages(
     assert main(arguments) == ExitCode.OK
     spec = json.loads(capsys.readouterr().out)
     assert spec["protocol"] == "cyclops-cron-install/v1"
-    assert spec["release"] == "0.2.2"
+    assert spec["release"] == "0.3.0"
     snapshot = tmp_path / "snapshot.json"
     snapshot.write_text("[]\n", encoding="utf-8")
     profile = tmp_path / ".hermes"
@@ -282,17 +285,178 @@ def test_cli_manager_install_dry_run_emits_spec_and_apply_only_stages(
     assert "snapshot" in capsys.readouterr().err
 
 
-def test_cli_manager_router_denies_task_scope_and_courier_is_silent(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "HERMES_KANBAN_TASK",
+        "HERMES_KANBAN_RUN",
+        "HERMES_KANBAN_RUN_ID",
+        "HERMES_KANBAN_WORKSPACE",
+        "HERMES_KANBAN_WORKSPACES_ROOT",
+        "HERMES_KANBAN_DB",
+        "HERMES_KANBAN_BOARD",
+        "HERMES_KANBAN_BRANCH",
+        "HERMES_KANBAN_CLAIM_LOCK",
+        "HERMES_DELEGATED_CHILD",
+        "HERMES_DELEGATED_CHILD_CONTEXT",
+        "HERMES_DELEGATION_PARENT",
+    ],
+)
+@pytest.mark.parametrize("role", ["router", "courier"])
+def test_cli_manager_scope_denial_precedes_config_activation_result_and_ledger_io(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    marker: str,
+    role: str,
+) -> None:
+    for key in manager_module._TASK_SCOPE_MARKERS:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv(marker, "")
+    monkeypatch.setattr(
+        cli,
+        "load_config",
+        lambda _path: pytest.fail("scope denial must precede configuration I/O"),
+    )
+
+    assert main(["manager", role, "--config", "missing.yaml"]) == ExitCode.OK
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out == ('{"wakeAgent":false}\n' if role == "router" else "")
+
+
+@pytest.mark.parametrize("home_kind", ["missing", "unsafe"])
+def test_cli_manager_missing_or_unsafe_profile_denies_before_lease_and_budget(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    home_kind: str,
 ) -> None:
     manifest_path = write_manifest(tmp_path / "mission.yaml")
     config = config_file(tmp_path, manifest_path)
-    with Ledger.create(tmp_path / "state" / "ledger.db"):
-        pass
+    if home_kind == "unsafe":
+        (tmp_path / ".hermes").mkdir(mode=0o750)
+    incident = IncidentObservation(
+        mission_id="synthetic-release",
+        phase_key="verify",
+        kind="phase_failed",
+        subject_task_id="c",
+        subject_run_id=None,
+        severity="critical",
+        observation_sha256="a" * 64,
+        expected_state="done",
+        observed_state="failed",
+    )
+    with Ledger.create(tmp_path / "state" / "ledger.db") as ledger:
+        ledger.register_mission("synthetic-release", "b" * 64)
+        ledger.observe_manager_incidents([incident], tick_seq=1, now=100.0)
+        ledger.observe_manager_incidents([incident], tick_seq=2, now=101.0)
+
+    inputs = type(
+        "Inputs",
+        (),
+        {"jobs": {"router": {"job_id": "job-router"}, "courier": {"job_id": "job-courier"}}},
+    )()
+    monkeypatch.setattr(cli, "manager_scope_denied", lambda _environment: False)
+    monkeypatch.setattr(cli, "load_activation_inputs", lambda **_kwargs: inputs)
+    monkeypatch.setattr(
+        cli,
+        "activation_verdict",
+        lambda _inputs: ActivationVerdict("supported", "supported", True),
+    )
+
     assert main(["manager", "router", "--config", str(config)]) == ExitCode.OK
-    assert json.loads(capsys.readouterr().out) == {"wakeAgent": False}
-    assert main(["manager", "courier", "--config", str(config)]) == ExitCode.OK
-    assert capsys.readouterr().out == ""
+    captured = capsys.readouterr()
+    assert captured.out == '{"wakeAgent":false}\n'
+    assert captured.err == ""
+    with Ledger.open(tmp_path / "state" / "ledger.db") as ledger:
+        assert ledger.current_manager_attempt() is None
+        assert ledger.manager_budget("synthetic-release", "1970-01-01") == 0
+
+
+@pytest.mark.parametrize("role", ["router", "courier"])
+def test_cli_manager_activation_evidence_failure_is_a_silent_negative_gate(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    role: str,
+) -> None:
+    manifest_path = write_manifest(tmp_path / "mission.yaml")
+    config = config_file(tmp_path, manifest_path)
+    monkeypatch.setattr(cli, "manager_scope_denied", lambda _environment: False)
+    monkeypatch.setattr(
+        cli,
+        "load_activation_inputs",
+        lambda **_kwargs: (_ for _ in ()).throw(ValidationError("private malformed evidence")),
+    )
+
+    assert main(["manager", role, "--config", str(config)]) == ExitCode.OK
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out == ('{"wakeAgent":false}\n' if role == "router" else "")
+
+
+@pytest.mark.parametrize("role", ["router", "courier"])
+def test_cli_manager_unsupported_activation_precedes_result_and_ledger_io(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    role: str,
+) -> None:
+    manifest_path = write_manifest(tmp_path / "mission.yaml")
+    config = config_file(tmp_path, manifest_path)
+    monkeypatch.setattr(cli, "manager_scope_denied", lambda _environment: False)
+    monkeypatch.setattr(cli, "load_activation_inputs", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        cli,
+        "activation_verdict",
+        lambda _inputs: ActivationVerdict("disabled", "unsupported", False),
+    )
+    monkeypatch.setattr(
+        cli,
+        "HermesCronResultAdapter",
+        lambda **_kwargs: pytest.fail("activation denial must precede result adapter creation"),
+    )
+
+    assert main(["manager", role, "--config", str(config)]) == ExitCode.OK
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out == ('{"wakeAgent":false}\n' if role == "router" else "")
+
+
+@pytest.mark.parametrize("role", ["router", "courier"])
+def test_cli_manager_result_adapter_failure_is_a_silent_negative_gate(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    role: str,
+) -> None:
+    manifest_path = write_manifest(tmp_path / "mission.yaml")
+    config = config_file(tmp_path, manifest_path)
+    monkeypatch.setattr(cli, "manager_scope_denied", lambda _environment: False)
+    monkeypatch.setattr(
+        cli,
+        "load_activation_inputs",
+        lambda **_kwargs: type(
+            "Inputs",
+            (),
+            {"jobs": {"router": {"job_id": "job-router"}, "courier": {"job_id": "job-courier"}}},
+        )(),
+    )
+    monkeypatch.setattr(
+        cli,
+        "activation_verdict",
+        lambda _inputs: ActivationVerdict("supported", "supported", True),
+    )
+    monkeypatch.setattr(
+        cli,
+        "HermesCronResultAdapter",
+        lambda **_kwargs: (_ for _ in ()).throw(ValidationError("private adapter failure")),
+    )
+
+    assert main(["manager", role, "--config", str(config)]) == ExitCode.OK
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out == ('{"wakeAgent":false}\n' if role == "router" else "")
 
 
 def test_cli_manager_activate_and_deactivate_are_dry_run_first(
@@ -354,13 +518,20 @@ def test_router_and_tick_use_configured_profile_not_ambient_hermes_home(
     manifest_path = write_manifest(tmp_path / "mission.yaml")
     config = config_file(tmp_path, manifest_path)
     configured_home = tmp_path / ".hermes"
+    configured_home.mkdir(mode=0o700)
     ambient_home = tmp_path / "ambient" / ".hermes" / "profiles" / "other"
     monkeypatch.setenv("HERMES_HOME", str(ambient_home))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "must-be-removed")
+    monkeypatch.setenv("HERMES_DELEGATION_PARENT", "must-also-be-removed")
     observed: list[Path] = []
 
     def load_current(**kwargs: object) -> object:
         observed.append(kwargs["hermes_home"])  # type: ignore[arg-type]
-        return object()
+        return type(
+            "Inputs",
+            (),
+            {"jobs": {"router": {"job_id": "job-router"}, "courier": {"job_id": "job-courier"}}},
+        )()
 
     monkeypatch.setattr(cli, "load_activation_inputs", load_current)
     monkeypatch.setattr(
@@ -373,11 +544,55 @@ def test_router_and_tick_use_configured_profile_not_ambient_hermes_home(
 
     def route_with_activation(*_args: object, **kwargs: object) -> dict[str, bool]:
         kwargs["activation_check"]()  # type: ignore[operator]
+        kwargs["result_collection"]("job-router", None)  # type: ignore[operator]
+        current = kwargs["current_incident"](  # type: ignore[operator]
+            {"mission_id": "synthetic-release", "incident_id": "incident-current"}
+        )
+        assert current is synthetic_incident
         return {"wakeAgent": False}
 
+    synthetic_incident = object()
+
+    class FakeResultAdapter:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def collect(self, _job: str, *, lease_acquired_at: float | None = None) -> object:
+            return ("collected", lease_acquired_at)
+
+    class FakeCollector:
+        def __init__(self, adapter: object) -> None:
+            environment = adapter.environment  # type: ignore[attr-defined]
+            assert environment["HERMES_HOME"] == str(configured_home)
+            assert environment["HERMES_HOME"] != os.environ["HERMES_HOME"]
+            assert "HERMES_KANBAN_TASK" not in environment
+            assert "HERMES_DELEGATION_PARENT" not in environment
+            self.configured = environment["HERMES_HOME"] == str(configured_home)
+
+        def collect(self, _board: str, _task_ids: list[str]) -> dict[str, object]:
+            return {"configured_profile": self.configured}
+
     monkeypatch.setattr(cli, "manager_router_gate", route_with_activation)
+    monkeypatch.setattr(cli, "manager_scope_denied", lambda _environment: False)
+    monkeypatch.setattr(cli, "HermesCronResultAdapter", FakeResultAdapter)
+    monkeypatch.setattr(cli, "ReadOnlyCollector", FakeCollector)
+    monkeypatch.setattr(
+        cli,
+        "incident_observations",
+        lambda _manifest, _bindings, raw: [synthetic_incident] if raw["configured_profile"] else [],
+    )
+    monkeypatch.setattr(cli, "stable_incident_id", lambda _incident: "incident-current")
     assert main(["manager", "router", "--config", str(config)]) == ExitCode.OK
     assert json.loads(capsys.readouterr().out) == {"wakeAgent": False}
+
+    def courier_with_activation(*_args: object, **kwargs: object) -> str:
+        kwargs["activation_check"]()  # type: ignore[operator]
+        kwargs["result_collection"]("job-courier", None)  # type: ignore[operator]
+        return "synthetic-packet"
+
+    monkeypatch.setattr(cli, "notification_courier", courier_with_activation)
+    assert main(["manager", "courier", "--config", str(config)]) == ExitCode.OK
+    assert capsys.readouterr().out == "synthetic-packet\n"
 
     tick_payload = {
         "schema_version": 1,
@@ -395,7 +610,7 @@ def test_router_and_tick_use_configured_profile_not_ambient_hermes_home(
     monkeypatch.setattr(cli, "run_tick", run_tick_with_activation)
     assert main(["tick", "--config", str(config), "--json"]) == ExitCode.OK
     assert json.loads(capsys.readouterr().out) == tick_payload
-    assert observed == [configured_home, configured_home]
+    assert observed == [configured_home, configured_home, configured_home]
 
 
 @pytest.mark.parametrize(
@@ -505,6 +720,7 @@ def test_cli_bootstrap_apply_creates_missing_ledger_and_tick_status_text(
 ) -> None:
     manifest_path = write_manifest(tmp_path / "mission.yaml")
     config = config_file(tmp_path, manifest_path)
+    (tmp_path / ".hermes").mkdir(mode=0o700)
     expected = {"build": "task-1", "review": "task-2", "verify": "task-3"}
     monkeypatch.setattr(cli, "apply_bootstrap", lambda *_args: expected)
     assert (
