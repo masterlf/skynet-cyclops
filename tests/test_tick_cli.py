@@ -255,7 +255,7 @@ def test_cli_manager_install_dry_run_emits_spec_and_apply_only_stages(
     assert main(arguments) == ExitCode.OK
     spec = json.loads(capsys.readouterr().out)
     assert spec["protocol"] == "cyclops-cron-install/v1"
-    assert spec["release"] == "0.2.2"
+    assert spec["release"] == "0.3.0"
     snapshot = tmp_path / "snapshot.json"
     snapshot.write_text("[]\n", encoding="utf-8")
     profile = tmp_path / ".hermes"
@@ -354,13 +354,18 @@ def test_router_and_tick_use_configured_profile_not_ambient_hermes_home(
     manifest_path = write_manifest(tmp_path / "mission.yaml")
     config = config_file(tmp_path, manifest_path)
     configured_home = tmp_path / ".hermes"
+    configured_home.mkdir(mode=0o700)
     ambient_home = tmp_path / "ambient" / ".hermes" / "profiles" / "other"
     monkeypatch.setenv("HERMES_HOME", str(ambient_home))
     observed: list[Path] = []
 
     def load_current(**kwargs: object) -> object:
         observed.append(kwargs["hermes_home"])  # type: ignore[arg-type]
-        return object()
+        return type(
+            "Inputs",
+            (),
+            {"jobs": {"router": {"job_id": "job-router"}, "courier": {"job_id": "job-courier"}}},
+        )()
 
     monkeypatch.setattr(cli, "load_activation_inputs", load_current)
     monkeypatch.setattr(
@@ -373,11 +378,46 @@ def test_router_and_tick_use_configured_profile_not_ambient_hermes_home(
 
     def route_with_activation(*_args: object, **kwargs: object) -> dict[str, bool]:
         kwargs["activation_check"]()  # type: ignore[operator]
+        kwargs["result_collection"]("job-router", None)  # type: ignore[operator]
+        current = kwargs["current_incident"](  # type: ignore[operator]
+            {"mission_id": "synthetic-release", "incident_id": "incident-current"}
+        )
+        assert current is synthetic_incident
         return {"wakeAgent": False}
 
+    synthetic_incident = object()
+
+    class FakeResultAdapter:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def collect(self, _job: str, *, lease_acquired_at: float | None = None) -> object:
+            return ("collected", lease_acquired_at)
+
+    class FakeCollector:
+        def __init__(self, _adapter: object) -> None:
+            pass
+
+        def collect(self, _board: str, _task_ids: list[str]) -> dict[str, object]:
+            return {}
+
     monkeypatch.setattr(cli, "manager_router_gate", route_with_activation)
+    monkeypatch.setattr(cli, "manager_scope_denied", lambda _environment: False)
+    monkeypatch.setattr(cli, "HermesCronResultAdapter", FakeResultAdapter)
+    monkeypatch.setattr(cli, "ReadOnlyCollector", FakeCollector)
+    monkeypatch.setattr(cli, "incident_observations", lambda *_args: [synthetic_incident])
+    monkeypatch.setattr(cli, "stable_incident_id", lambda _incident: "incident-current")
     assert main(["manager", "router", "--config", str(config)]) == ExitCode.OK
     assert json.loads(capsys.readouterr().out) == {"wakeAgent": False}
+
+    def courier_with_activation(*_args: object, **kwargs: object) -> str:
+        kwargs["activation_check"]()  # type: ignore[operator]
+        kwargs["result_collection"]("job-courier", None)  # type: ignore[operator]
+        return "synthetic-packet"
+
+    monkeypatch.setattr(cli, "notification_courier", courier_with_activation)
+    assert main(["manager", "courier", "--config", str(config)]) == ExitCode.OK
+    assert capsys.readouterr().out == "synthetic-packet\n"
 
     tick_payload = {
         "schema_version": 1,
@@ -395,7 +435,7 @@ def test_router_and_tick_use_configured_profile_not_ambient_hermes_home(
     monkeypatch.setattr(cli, "run_tick", run_tick_with_activation)
     assert main(["tick", "--config", str(config), "--json"]) == ExitCode.OK
     assert json.loads(capsys.readouterr().out) == tick_payload
-    assert observed == [configured_home, configured_home]
+    assert observed == [configured_home, configured_home, configured_home]
 
 
 @pytest.mark.parametrize(

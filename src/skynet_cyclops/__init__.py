@@ -3,4 +3,4 @@
 from .manifest import Manifest, Mission, Phase
 
 __all__ = ["Manifest", "Mission", "Phase"]
-__version__ = "0.2.2"
+__version__ = "0.3.0"

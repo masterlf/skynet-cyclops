@@ -26,7 +26,7 @@ from .errors import ValidationError
 
 ACTIVATION_PROTOCOL = "cyclops-manager-activation/v1"
 SEAM_PROTOCOL = "cyclops-hermes-seam-evidence/v1"
-RELEASE = "0.2.2"
+RELEASE = "0.3.0"
 MAX_ACTIVATION_BYTES = 16 * 1024
 MAX_EVIDENCE_BYTES = 256 * 1024
 MAX_HERMES_READBACK_BYTES = 1024 * 1024

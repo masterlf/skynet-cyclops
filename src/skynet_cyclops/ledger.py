@@ -19,7 +19,7 @@ from typing import Any
 
 from .errors import LedgerError
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _SCHEMA = """
 CREATE TABLE meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -108,8 +108,11 @@ CREATE TABLE notification_intents (
     decision_packet_id TEXT NOT NULL UNIQUE,
     state TEXT NOT NULL CHECK (state IN ('pending', 'leased', 'sent', 'failed', 'acknowledged')),
     attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count BETWEEN 0 AND 2),
+    lease_acquired_at REAL,
     lease_expires_at REAL,
-    courier_execution_id TEXT,
+    next_attempt_at REAL NOT NULL DEFAULT 0,
+    last_outcome TEXT CHECK (last_outcome IN ('delivered', 'failed', 'not_configured', 'suppressed', 'malformed')),
+    courier_execution_id TEXT UNIQUE,
     created_at REAL NOT NULL,
     PRIMARY KEY (incident_id, generation, terminal_kind),
     FOREIGN KEY (incident_id, generation) REFERENCES incidents(incident_id, generation) ON DELETE CASCADE
@@ -117,7 +120,7 @@ CREATE TABLE notification_intents (
 CREATE INDEX incidents_eligibility ON incidents(lifecycle, next_attempt_at, severity, first_tick);
 CREATE INDEX wake_attempts_lease ON wake_attempts(state, lease_expires_at);
 CREATE INDEX notifications_delivery ON notification_intents(state, created_at);
-INSERT INTO meta(singleton, schema_version, mode) VALUES (1, 2, 'observe');
+INSERT INTO meta(singleton, schema_version, mode) VALUES (1, 3, 'observe');
 """
 
 _MIGRATION_V2 = (
@@ -174,6 +177,14 @@ _MIGRATION_V2 = (
     "CREATE INDEX wake_attempts_lease ON wake_attempts(state, lease_expires_at)",
     "CREATE INDEX notifications_delivery ON notification_intents(state, created_at)",
     "UPDATE meta SET schema_version=2 WHERE singleton=1 AND schema_version=1",
+)
+
+_MIGRATION_V3 = (
+    "ALTER TABLE notification_intents ADD COLUMN lease_acquired_at REAL",
+    "ALTER TABLE notification_intents ADD COLUMN next_attempt_at REAL NOT NULL DEFAULT 0",
+    "ALTER TABLE notification_intents ADD COLUMN last_outcome TEXT",
+    "CREATE UNIQUE INDEX notification_execution_unique ON notification_intents(courier_execution_id)",
+    "UPDATE meta SET schema_version=3 WHERE singleton=1 AND schema_version=2",
 )
 
 
@@ -248,6 +259,8 @@ class Ledger:
             source.execute("BEGIN IMMEDIATE")
             for statement in _MIGRATION_V2:
                 source.execute(statement)
+            for statement in _MIGRATION_V3:
+                source.execute(statement)
             if source.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise LedgerError("ledger migration violated referential integrity")
             source.commit()
@@ -286,6 +299,64 @@ class Ledger:
             if isinstance(exc, LedgerError):
                 raise
             raise LedgerError("ledger migration failed and was rolled back") from exc
+
+    @classmethod
+    def migrate_v2(cls, path: str | os.PathLike[str], backup_path: str | os.PathLike[str]) -> None:
+        """Upgrade an exact private v2 ledger to v3 with a durable pre-migration backup."""
+        candidate = Path(path)
+        backup = Path(backup_path)
+        source: sqlite3.Connection | None = None
+        destination: sqlite3.Connection | None = None
+        try:
+            info = candidate.lstat()
+            if (
+                candidate.is_symlink()
+                or not stat.S_ISREG(info.st_mode)
+                or (hasattr(os, "getuid") and info.st_uid != os.getuid())
+                or stat.S_IMODE(info.st_mode) & 0o077
+            ):
+                raise LedgerError("ledger migration source is unsafe")
+            source = sqlite3.connect(candidate, timeout=5.0)
+            if source.execute("SELECT schema_version FROM meta WHERE singleton=1").fetchone() != (
+                2,
+            ):
+                raise LedgerError("ledger schema is not migration source v2")
+            columns = {
+                str(row[1]) for row in source.execute("PRAGMA table_info(notification_intents)")
+            }
+            if columns & {"lease_acquired_at", "next_attempt_at", "last_outcome"}:
+                raise LedgerError("ledger v2 notification schema is not exact")
+            _secure_parent(backup.parent)
+            descriptor = os.open(
+                backup,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            os.close(descriptor)
+            destination = sqlite3.connect(backup)
+            source.backup(destination)
+            destination.commit()
+            destination.close()
+            destination = None
+            source.execute("BEGIN IMMEDIATE")
+            for statement in _MIGRATION_V3:
+                source.execute(statement)
+            source.commit()
+            source.close()
+            source = None
+            os.chmod(backup, 0o600)
+            with cls.open(candidate):
+                pass
+        except (OSError, sqlite3.Error, LedgerError) as exc:
+            if source is not None:
+                with suppress(sqlite3.Error):
+                    source.rollback()
+                source.close()
+            if destination is not None:
+                destination.close()
+            if isinstance(exc, LedgerError):
+                raise
+            raise LedgerError("ledger v2 migration failed") from exc
 
     @classmethod
     def open(cls, path: str | os.PathLike[str]) -> Ledger:
@@ -828,6 +899,14 @@ class Ledger:
         )
         return None if row is None else dict(zip(keys, row, strict=True))
 
+    def current_manager_attempt(self) -> dict[str, object] | None:
+        rows = self._connection.execute(
+            "SELECT attempt_id FROM wake_attempts WHERE state='leased' ORDER BY lease_acquired_at LIMIT 2"
+        ).fetchall()
+        if len(rows) != 1:
+            return None
+        return self.manager_attempt(str(rows[0][0]))
+
     def manager_incident(self, incident_id: str, generation: int) -> dict[str, object] | None:
         rows = self.manager_incidents(incident_id=incident_id, generation=generation)
         return None if not rows else rows[0]
@@ -914,6 +993,39 @@ class Ledger:
             (attempt_id,),
         )
         self._connection.commit()
+
+    def resolve_manager_result(
+        self, *, attempt_id: str, cron_execution_id: str, now: float
+    ) -> None:
+        """Atomically record a late result after the authoritative condition cleared."""
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            attempt = self._connection.execute(
+                "SELECT incident_id, generation FROM wake_attempts WHERE attempt_id=? AND state='leased'",
+                (attempt_id,),
+            ).fetchone()
+            if attempt is None:
+                raise LedgerError("manager result attempt changed concurrently")
+            cursor = self._connection.execute(
+                """UPDATE wake_attempts SET state='superseded', cron_execution_id=?
+                   WHERE attempt_id=? AND state='leased'""",
+                (cron_execution_id, attempt_id),
+            )
+            if cursor.rowcount != 1:
+                raise LedgerError("manager result attempt changed concurrently")
+            self._connection.execute(
+                """UPDATE incidents SET lifecycle='resolved', disposition='resolved',
+                       terminal_reason='condition_cleared', terminal_at=?, updated_at=?, clean_tick=1
+                   WHERE incident_id=? AND generation=? AND lifecycle='wake_sent'""",
+                (now, now, attempt[0], attempt[1]),
+            )
+            self._connection.commit()
+        except LedgerError:
+            self._connection.rollback()
+            raise
+        except sqlite3.Error as exc:
+            self._connection.rollback()
+            raise LedgerError("manager result could not be committed") from exc
 
     def accept_manager_ack(
         self,
@@ -1004,9 +1116,10 @@ class Ledger:
         try:
             self._connection.execute("BEGIN IMMEDIATE")
             self._connection.execute(
-                """UPDATE notification_intents SET state='pending', lease_expires_at=NULL
+                """UPDATE notification_intents SET state='pending', lease_acquired_at=NULL,
+                       lease_expires_at=NULL, next_attempt_at=?
                    WHERE state='leased' AND lease_expires_at<=? AND attempt_count<2""",
-                (now,),
+                (now + 300, now),
             )
             self._connection.execute(
                 """UPDATE notification_intents SET state='failed'
@@ -1019,62 +1132,109 @@ class Ledger:
                           i.reason_code, i.human_question_code, i.observed_ticks, i.attempt_count
                    FROM notification_intents n JOIN incidents i
                      ON i.incident_id=n.incident_id AND i.generation=n.generation
-                   WHERE n.state='pending' AND n.attempt_count<2
-                   ORDER BY n.created_at, n.decision_packet_id LIMIT 1"""
+                   WHERE n.state='pending' AND n.attempt_count<2 AND n.next_attempt_at<=?
+                   ORDER BY n.created_at, n.decision_packet_id LIMIT 1""",
+                (now,),
             ).fetchone()
             if row is None:
                 self._connection.commit()
                 return None
             self._connection.execute(
                 """UPDATE notification_intents SET state='leased', attempt_count=attempt_count+1,
-                       lease_expires_at=?
+                       lease_acquired_at=?, lease_expires_at=?
                    WHERE incident_id=? AND generation=? AND terminal_kind=? AND state='pending'""",
-                (now + 300, row[0], row[1], row[2]),
+                (now, now + 300, row[0], row[1], row[2]),
             )
             self._connection.commit()
-            return {
-                "packet_version": 1,
-                "decision_packet_id": str(row[3]),
-                "incident_id": str(row[0]),
-                "generation": int(row[1]),
-                "kind": str(row[4]),
-                "severity": str(row[5]),
-                "mission_id": str(row[6]),
-                "phase_key": str(row[7]),
-                "terminal": str(row[2]),
-                "reason_code": str(row[8] or "AMBIGUOUS_STATE"),
-                "human_question_code": str(row[9] or "REVIEW_INCIDENT"),
-                "observed_ticks": int(row[10]),
-                "attempt_count": int(row[11]),
-            }
+            return self._notification_packet(row)
         except sqlite3.Error as exc:
             self._connection.rollback()
-            raise LedgerError("notification intent could not be leased") from exc
+            raise LedgerError("notification lease could not be committed") from exc
+
+    @staticmethod
+    def _notification_packet(row: tuple[Any, ...]) -> dict[str, object]:
+        return {
+            "packet_version": 1,
+            "decision_packet_id": str(row[3]),
+            "incident_id": str(row[0]),
+            "generation": int(row[1]),
+            "kind": str(row[4]),
+            "severity": str(row[5]),
+            "mission_id": str(row[6]),
+            "phase_key": str(row[7]),
+            "terminal": str(row[2]),
+            "reason_code": str(row[8] or "AMBIGUOUS_STATE"),
+            "human_question_code": str(row[9] or "REVIEW_INCIDENT"),
+            "observed_ticks": int(row[10]),
+            "attempt_count": int(row[11]),
+        }
+
+    def current_notification(self) -> dict[str, object] | None:
+        rows = self._connection.execute(
+            """SELECT n.incident_id, n.generation, n.terminal_kind, n.decision_packet_id,
+                      i.kind, i.severity, i.mission_id, i.phase_key, i.reason_code,
+                      i.human_question_code, i.observed_ticks, i.attempt_count,
+                      n.lease_acquired_at, n.lease_expires_at, n.attempt_count
+               FROM notification_intents n JOIN incidents i
+                 ON i.incident_id=n.incident_id AND i.generation=n.generation
+               WHERE n.state='leased' ORDER BY n.lease_acquired_at LIMIT 2"""
+        ).fetchall()
+        if len(rows) != 1:
+            return None
+        return {
+            "packet": self._notification_packet(rows[0]),
+            "lease_acquired_at": float(rows[0][12]),
+            "lease_expires_at": float(rows[0][13]),
+            "delivery_attempt_count": int(rows[0][14]),
+        }
 
     def record_notification_result(
         self,
         decision_packet_id: str,
         *,
-        courier_execution_id: str,
-        delivered: bool,
+        courier_execution_id: str | None,
+        outcome: str | None = None,
+        now: float = 0.0,
+        delivered: bool | None = None,
     ) -> None:
-        """Fence a courier result; verified success suppresses all later emission."""
-        next_state = "sent" if delivered else "pending"
-        cursor = self._connection.execute(
-            """UPDATE notification_intents
-               SET state=CASE
-                   WHEN ? THEN 'sent'
-                   WHEN attempt_count>=2 THEN 'failed'
-                   ELSE ?
-               END,
-               courier_execution_id=?, lease_expires_at=NULL
-               WHERE decision_packet_id=? AND state='leased'""",
-            (delivered, next_state, courier_execution_id, decision_packet_id),
-        )
-        if cursor.rowcount != 1:
+        if outcome is None and delivered is not None:
+            outcome = "delivered" if delivered else "failed"
+        if outcome not in {"delivered", "failed", "not_configured", "suppressed", "malformed"}:
+            raise LedgerError("notification result outcome is invalid")
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            row = self._connection.execute(
+                "SELECT attempt_count FROM notification_intents WHERE decision_packet_id=? AND state='leased'",
+                (decision_packet_id,),
+            ).fetchone()
+            if row is None:
+                replay = self._connection.execute(
+                    "SELECT state, courier_execution_id FROM notification_intents WHERE decision_packet_id=?",
+                    (decision_packet_id,),
+                ).fetchone()
+                if replay == ("sent", courier_execution_id):
+                    self._connection.commit()
+                    return
+                raise LedgerError("notification result fence mismatch")
+            if outcome == "delivered":
+                state, next_attempt = "sent", 0.0
+            elif int(row[0]) >= 2:
+                state, next_attempt = "failed", 0.0
+            else:
+                state, next_attempt = "pending", now + 300
+            self._connection.execute(
+                """UPDATE notification_intents SET state=?, courier_execution_id=?,
+                       last_outcome=?, next_attempt_at=?, lease_acquired_at=NULL,
+                       lease_expires_at=NULL WHERE decision_packet_id=? AND state='leased'""",
+                (state, courier_execution_id, outcome, next_attempt, decision_packet_id),
+            )
+            self._connection.commit()
+        except LedgerError:
             self._connection.rollback()
-            raise LedgerError("notification result fence mismatch")
-        self._connection.commit()
+            raise
+        except sqlite3.Error as exc:
+            self._connection.rollback()
+            raise LedgerError("notification result could not be committed") from exc
 
     def acknowledge_incident(self, incident_id: str, generation: int, *, now: float) -> None:
         cursor = self._connection.execute(

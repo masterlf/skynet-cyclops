@@ -55,7 +55,7 @@ def tasks() -> list[dict[str, object]]:
 def test_ledger_schema_security_and_corruption_fail_closed(tmp_path: Path) -> None:
     path = tmp_path / "private" / "ledger.db"
     with Ledger.create(path) as ledger:
-        assert ledger.schema_version == 2
+        assert ledger.schema_version == 3
         assert ledger.mode == "observe"
         pragmas = ledger.pragmas()
         assert pragmas["foreign_keys"] == 1
@@ -393,7 +393,7 @@ def test_ledger_rejects_wrong_owner_schema_and_unsafe_directory(
     monkeypatch.undo()
 
     connection = sqlite3.connect(path)
-    connection.execute("UPDATE meta SET schema_version=3 WHERE singleton=1")
+    connection.execute("UPDATE meta SET schema_version=4 WHERE singleton=1")
     connection.commit()
     connection.close()
     with pytest.raises(LedgerError, match="schema"):

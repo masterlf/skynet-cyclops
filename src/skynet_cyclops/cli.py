@@ -14,7 +14,6 @@ from pathlib import Path
 
 from .activation import (
     ActivationInputs,
-    ActivationVerdict,
     activate_manager,
     activation_verdict,
     deactivate_manager,
@@ -24,12 +23,19 @@ from .adapter import HermesAdapter, ReadOnlyCollector
 from .bootstrap import apply_bootstrap, plan_bootstrap
 from .config import Config, default_config_path, default_ledger_path, load_config
 from .errors import AdapterError, CyclopsError, LedgerError, ProjectionError, ValidationError
+from .hermes_results import HermesCronResultAdapter
 from .ledger import Ledger
-from .manager import manager_router_gate, notification_courier
+from .manager import (
+    IncidentObservation,
+    manager_router_gate,
+    manager_scope_denied,
+    notification_courier,
+    stable_incident_id,
+)
 from .manager_install import build_cron_install_spec, stage_cron_install
 from .manifest import canonical_manifest_hash, load_manifest
 from .projection import read_projection
-from .tick import run_tick
+from .tick import incident_observations, run_tick
 
 
 class ExitCode(IntEnum):
@@ -214,28 +220,66 @@ def _execute(args: argparse.Namespace) -> ExitCode:
             )
             return ExitCode.OK
 
-        def current_activation() -> ActivationVerdict:
-            return activation_verdict(
-                load_activation_inputs(
-                    activation_path=activation_path,
-                    hermes_home=profile_home,
-                    evidence_path=evidence_path,
-                    hermes_binary=config.hermes_binary,
-                )
+        with Ledger.open(config.ledger_path) as ledger:
+            if manager_scope_denied(os.environ):
+                if args.manager_command == "router":
+                    _json({"wakeAgent": False})
+                return ExitCode.OK
+            inputs = load_activation_inputs(
+                activation_path=activation_path,
+                hermes_home=profile_home,
+                evidence_path=evidence_path,
+                hermes_binary=config.hermes_binary,
+            )
+            verdict = activation_verdict(inputs)
+            role = "router" if args.manager_command == "router" else "courier"
+            job_id = str(inputs.jobs[role]["job_id"])
+            result_adapter = HermesCronResultAdapter(
+                binary=config.hermes_binary,
+                hermes_home=profile_home,
+                environment=os.environ,
             )
 
-        with Ledger.open(config.ledger_path) as ledger:
+            def current_incident(stored: dict[str, object]) -> IncidentObservation | None:
+                manifest = load_manifest(config.manifest_path)
+                bindings = ledger.bindings(str(stored["mission_id"]))
+                raw = ReadOnlyCollector(HermesAdapter(binary=config.hermes_binary)).collect(
+                    manifest.mission.board, list(bindings.values())
+                )
+                matches = [
+                    item
+                    for item in incident_observations(manifest, bindings, raw)
+                    if stable_incident_id(item) == stored["incident_id"]
+                ]
+                if len(matches) > 1:
+                    raise ValidationError("manager incident revalidation is ambiguous")
+                return None if not matches else matches[0]
+
             if args.manager_command == "router":
                 _json(
                     manager_router_gate(
                         ledger,
                         now=time.time(),
                         environment=os.environ,
-                        activation_check=current_activation,
+                        activation_check=lambda: verdict,
+                        router_job_id=job_id,
+                        result_collection=lambda exact_job, acquired: result_adapter.collect(
+                            exact_job, lease_acquired_at=acquired
+                        ),
+                        current_incident=current_incident,
                     )
                 )
             else:
-                output = notification_courier(ledger, now=time.time())
+                output = notification_courier(
+                    ledger,
+                    now=time.time(),
+                    environment=os.environ,
+                    activation_check=lambda: verdict,
+                    courier_job_id=job_id,
+                    result_collection=lambda exact_job, acquired: result_adapter.collect(
+                        exact_job, lease_acquired_at=acquired
+                    ),
+                )
                 if output:
                     print(output)
         return ExitCode.OK

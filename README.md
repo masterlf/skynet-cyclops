@@ -6,7 +6,8 @@
 
 Skynet-Cyclops watches durable Hermes Kanban missions without becoming another dispatcher. Kanban remains authoritative; Cyclops derives health from supported CLI/API output, records bounded incidents, and publishes a read-only status projection. Healthy ticks use **zero LLM calls**.
 
-Version 0.2.2 adds a disabled-by-default, diagnose/propose-only manager
+Version 0.3.0 adds bounded runtime manager-result and courier-delivery ingestion to the
+disabled-by-default, diagnose/propose-only manager
 wake path. It persists stable incident generations, leases at most one fresh `default`-profile
 cron session, validates a fenced JSON ACK, revalidates typed state, and exposes `resolved`,
 `human_required`, or `dead_letter`. Healthy and ineligible router/courier ticks remain model-free.
@@ -57,7 +58,8 @@ See:
 
 ## Status
 
-Version 0.2.2 adds fail-closed activation attestation to the durable manager lifecycle and staged,
+Version 0.3.0 retains fail-closed activation attestation and adds strict supported Hermes
+`runs`/`result` protocol ingestion to the durable manager lifecycle and staged,
 tool-mediated installation contract. Manager jobs remain paused until an operator records exact job
 IDs and seam evidence, applies activation with successful live full-definition CLI readback, verifies
 the projected state, and separately resumes them through supported Hermes operations. No production
