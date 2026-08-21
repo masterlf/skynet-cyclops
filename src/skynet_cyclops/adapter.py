@@ -238,7 +238,7 @@ def normalize_run_rows(value: object, task_id: str) -> list[dict[str, Any]]:
             raise ValidationError("runs contains a duplicate id")
         seen.add(identifier)
         status = _safe_identifier(raw["status"], "run.status")
-        metadata = raw["metadata"]
+        metadata = {} if raw["metadata"] is None else raw["metadata"]
         if not isinstance(metadata, dict) or len(metadata) > 64:
             raise ValidationError("run metadata has an invalid shape")
         try:
@@ -607,7 +607,7 @@ class HermesAdapter:
             "--idempotency-key",
             safe_key,
             "--initial-status",
-            "blocked",
+            "todo",
             "--max-runtime",
             str(contract["max_runtime_seconds"]),
             "--max-retries",

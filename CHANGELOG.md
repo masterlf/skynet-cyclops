@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented here. The project follows Semantic Versioning after public releases.
 
+## [0.3.1] - 2026-08-21
+
+### Fixed
+
+- Stage bootstrap cards as `todo`, revalidate exact card identity and the complete dependency graph,
+  then promote only roots so current Hermes cannot expose a parentless card during staging.
+- Normalize administrative `run.metadata=null` as an empty bounded mapping while rejecting every
+  other non-mapping shape.
+- Add strict paused v0.3.0 to v0.3.1 manager-job upgrade validation with update-only rollback.
+
 ## [0.3.0] - 2026-08-21
 
 - Add a bounded fixed-argv Hermes cron runs/result adapter with explicit canonical `HERMES_HOME`.

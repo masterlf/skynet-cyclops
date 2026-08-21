@@ -21,11 +21,11 @@ from pathlib import Path
 from typing import cast
 
 from .errors import ValidationError
-from .manager import MANAGER_PROMPT, MANAGER_PROMPT_V0_2_2
+from .manager import MANAGER_PROMPT, MANAGER_PROMPT_V0_2_2, MANAGER_PROMPT_V0_3_0
 
 _PROTOCOL = "cyclops-cron-install/v1"
-_RELEASE = "0.3.0"
-_PRIOR_RELEASE = "0.2.2"
+_RELEASE = "0.3.1"
+_PRIOR_RELEASE = "0.3.0"
 _STABLE_NAMES = ("cyclops-manager-router", "cyclops-decision-courier")
 _HEX = frozenset("0123456789abcdef")
 _SPEC_KEYS = frozenset(
@@ -258,7 +258,10 @@ def _validate_previous_spec(value: object) -> dict[str, object]:
         raise ValidationError("upgrade prior spec arguments are invalid")
     try:
         return _validate_cron_install_spec(
-            value, expected_release=_PRIOR_RELEASE, manager_prompt=MANAGER_PROMPT_V0_2_2
+            value,
+            expected_release=_PRIOR_RELEASE,
+            manager_prompt=MANAGER_PROMPT_V0_3_0,
+            rollback_manager_prompt=MANAGER_PROMPT_V0_2_2,
         )
     except ValidationError as exc:
         raise ValidationError("upgrade requires the exact prior spec") from exc
@@ -375,6 +378,7 @@ def _validate_cron_install_spec(
     *,
     expected_release: str = _RELEASE,
     manager_prompt: str = MANAGER_PROMPT,
+    rollback_manager_prompt: str = MANAGER_PROMPT_V0_3_0,
 ) -> dict[str, object]:
     """Validate the complete closed mutation contract before any side effect."""
     try:
@@ -496,7 +500,7 @@ def _validate_cron_install_spec(
                 raise ValidationError("cron install execution spec is invalid")
             prior_arguments = _job_arguments(
                 _home_delivery(prior_courier_arguments.get("deliver")),
-                manager_prompt=MANAGER_PROMPT_V0_2_2,
+                manager_prompt=rollback_manager_prompt,
             )
             expected_rollback = [
                 {
@@ -516,7 +520,7 @@ def _validate_cron_install_spec(
         raise ValidationError("cron install execution spec is invalid") from exc
 
 
-def build_cron_install_spec_v0_2_2(
+def build_cron_install_spec_v0_3_0(
     *,
     home_delivery: str,
     attempt_nonce: str,
@@ -524,9 +528,9 @@ def build_cron_install_spec_v0_2_2(
     operation: str = "install",
     visible_jobs: Sequence[Mapping[str, object]] = (),
 ) -> dict[str, object]:
-    """Generate the immutable exact prior install contract accepted for v0.3 upgrade."""
+    """Generate the immutable exact prior install contract accepted for v0.3.1 upgrade."""
     if profile != "default" or operation != "install" or visible_jobs:
-        raise ValidationError("prior install generator accepts only the exact v0.2.2 baseline")
+        raise ValidationError("prior install generator accepts only the exact v0.3.0 baseline")
     spec = build_cron_install_spec(
         profile="default",
         home_delivery=home_delivery,
@@ -537,9 +541,12 @@ def build_cron_install_spec_v0_2_2(
     spec["release"] = _PRIOR_RELEASE
     operations = cast(list[dict[str, object]], spec["operations"])
     router_arguments = cast(dict[str, object], operations[0]["arguments"])
-    router_arguments["prompt"] = MANAGER_PROMPT_V0_2_2
+    router_arguments["prompt"] = MANAGER_PROMPT_V0_3_0
     _validate_cron_install_spec(
-        spec, expected_release=_PRIOR_RELEASE, manager_prompt=MANAGER_PROMPT_V0_2_2
+        spec,
+        expected_release=_PRIOR_RELEASE,
+        manager_prompt=MANAGER_PROMPT_V0_3_0,
+        rollback_manager_prompt=MANAGER_PROMPT_V0_2_2,
     )
     return spec
 

@@ -157,7 +157,7 @@ For a manager-package rollback, first apply deactivation and verify the shared v
 `wake_enabled=false`. Then pause router and courier using supported `cronjob` operations and obtain
 exact full-definition readback proving both are paused. Only then restore package/spec/scripts.
 Never resume v0.2.0 jobs: that release does not enforce activation attestation. If paused readback
-cannot be proven, leave v0.2.2 installed and fail the rollback closed.
+cannot be proven, leave v0.3.0 installed and fail the rollback closed.
 
 ## Troubleshooting
 
