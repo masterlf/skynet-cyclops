@@ -333,3 +333,88 @@ def test_remaining_malformed_deadline_and_home_boundaries(tmp_path: Path) -> Non
         adapter._run((), deadline=time.monotonic() - 1)
     with pytest.raises(ValidationError, match="unavailable"):
         HermesCronResultAdapter(binary=str(executable), hermes_home=tmp_path / "absent" / ".hermes")
+
+
+def test_collection_fails_closed_for_missing_command_and_run_result_lifecycle_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = private_home(tmp_path)
+    missing = HermesCronResultAdapter(
+        binary="cyclops-hermes-command-that-does-not-exist", hermes_home=home
+    )
+    with pytest.raises(ValidationError, match="command is unavailable"):
+        missing.collect("job-router")
+
+    adapter = HermesCronResultAdapter(binary=str(fake_hermes(tmp_path)), hermes_home=home)
+    run = {
+        "execution_id": "exec-1",
+        "job_id": "job-router",
+        "status": "completed",
+        "claimed_at": "2026-08-21T00:00:00Z",
+        "started_at": "2026-08-21T00:00:01Z",
+        "finished_at": "2026-08-21T00:00:02Z",
+        "result_available": True,
+    }
+    response = "synthetic"
+
+    def drifted_run(arguments: tuple[str, ...], *, deadline: float) -> str:
+        assert deadline > time.monotonic()
+        if arguments[1] == "runs":
+            return json.dumps(
+                {
+                    "protocol": "hermes-cron-runs/v1",
+                    "job_id": "job-router",
+                    "limit": 32,
+                    "runs": [run],
+                }
+            )
+        result = {
+            "protocol": "hermes-cron-result/v1",
+            "execution_id": "exec-1",
+            "job_id": "job-router",
+            "status": "completed",
+            "claimed_at": "2026-08-21T00:00:00Z",
+            "started_at": "2026-08-21T00:00:01Z",
+            "finished_at": "2026-08-21T00:00:03Z",
+            "final_response": response,
+            "final_response_sha256": hashlib.sha256(response.encode()).hexdigest(),
+            "final_response_bytes": len(response),
+        }
+        return json.dumps(result)
+
+    monkeypatch.setattr(adapter, "_run", drifted_run)
+    with pytest.raises(ValidationError, match="lifecycle does not match"):
+        adapter.collect("job-router")
+
+
+def test_full_run_window_without_results_uses_lease_boundary_for_completeness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = HermesCronResultAdapter(
+        binary=str(fake_hermes(tmp_path)), hermes_home=private_home(tmp_path)
+    )
+    runs = [
+        {
+            "execution_id": f"exec-{index:02d}",
+            "job_id": "job-router",
+            "status": "failed",
+            "claimed_at": f"2026-08-21T00:00:{31 - index:02d}Z",
+            "started_at": f"2026-08-21T00:00:{31 - index:02d}Z",
+            "finished_at": f"2026-08-21T00:00:{31 - index:02d}Z",
+            "result_available": False,
+        }
+        for index in range(32)
+    ]
+    raw = json.dumps(
+        {
+            "protocol": "hermes-cron-runs/v1",
+            "job_id": "job-router",
+            "limit": 32,
+            "runs": runs,
+        }
+    )
+    monkeypatch.setattr(adapter, "_run", lambda _arguments, *, deadline: raw)
+
+    collection = adapter.collect("job-router", lease_acquired_at=1787270400.0)
+    assert collection.complete is True
+    assert collection.results == ()

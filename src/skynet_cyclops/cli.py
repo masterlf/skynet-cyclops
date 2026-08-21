@@ -97,6 +97,12 @@ def _json(value: object) -> None:
     print(json.dumps(value, sort_keys=True, separators=(",", ":")))
 
 
+def _manager_negative_gate(role: str) -> ExitCode:
+    if role == "router":
+        _json({"wakeAgent": False})
+    return ExitCode.OK
+
+
 def _utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -189,6 +195,8 @@ def _execute(args: argparse.Namespace) -> ExitCode:
                 stage_cron_install(spec, Path(args.hermes_home))
             _json(spec)
             return ExitCode.OK
+        if args.manager_command in {"router", "courier"} and manager_scope_denied(os.environ):
+            return _manager_negative_gate(args.manager_command)
         config = load_config(args.config)
         activation_path, evidence_path, profile_home = _activation_paths(
             config,
@@ -224,11 +232,7 @@ def _execute(args: argparse.Namespace) -> ExitCode:
             )
             return ExitCode.OK
 
-        with Ledger.open(config.ledger_path) as ledger:
-            if manager_scope_denied(os.environ):
-                if args.manager_command == "router":
-                    _json({"wakeAgent": False})
-                return ExitCode.OK
+        try:
             inputs = load_activation_inputs(
                 activation_path=activation_path,
                 hermes_home=profile_home,
@@ -236,6 +240,8 @@ def _execute(args: argparse.Namespace) -> ExitCode:
                 hermes_binary=config.hermes_binary,
             )
             verdict = activation_verdict(inputs)
+            if not verdict.wake_enabled:
+                return _manager_negative_gate(args.manager_command)
             role = "router" if args.manager_command == "router" else "courier"
             job_id = str(inputs.jobs[role]["job_id"])
             result_adapter = HermesCronResultAdapter(
@@ -243,6 +249,10 @@ def _execute(args: argparse.Namespace) -> ExitCode:
                 hermes_home=profile_home,
                 environment=os.environ,
             )
+        except (AdapterError, ValidationError, AttributeError, KeyError, TypeError):
+            return _manager_negative_gate(args.manager_command)
+
+        with Ledger.open(config.ledger_path) as ledger:
 
             def current_incident(stored: dict[str, object]) -> IncidentObservation | None:
                 manifest = load_manifest(config.manifest_path)
