@@ -139,7 +139,11 @@ def _bootstrap(args: argparse.Namespace) -> ExitCode:
         _json({"mode": "dry-run", "plan": [item.to_dict() for item in plan]})
         return ExitCode.OK
     config = load_config(args.config)
-    adapter = HermesAdapter(binary=config.hermes_binary)
+    adapter = HermesAdapter(
+        binary=config.hermes_binary,
+        hermes_home=config.hermes_home,
+        environment=os.environ,
+    )
     ledger_path = config.ledger_path if config.ledger_path else default_ledger_path()
     try:
         ledger = Ledger.open(ledger_path)
@@ -243,9 +247,13 @@ def _execute(args: argparse.Namespace) -> ExitCode:
             def current_incident(stored: dict[str, object]) -> IncidentObservation | None:
                 manifest = load_manifest(config.manifest_path)
                 bindings = ledger.bindings(str(stored["mission_id"]))
-                raw = ReadOnlyCollector(HermesAdapter(binary=config.hermes_binary)).collect(
-                    manifest.mission.board, list(bindings.values())
-                )
+                raw = ReadOnlyCollector(
+                    HermesAdapter(
+                        binary=config.hermes_binary,
+                        hermes_home=profile_home,
+                        environment=os.environ,
+                    )
+                ).collect(manifest.mission.board, list(bindings.values()))
                 matches = [
                     item
                     for item in incident_observations(manifest, bindings, raw)
@@ -291,7 +299,13 @@ def _execute(args: argparse.Namespace) -> ExitCode:
             manifest,
             config.ledger_path,
             config.status_path,
-            ReadOnlyCollector(HermesAdapter(binary=config.hermes_binary)),
+            ReadOnlyCollector(
+                HermesAdapter(
+                    binary=config.hermes_binary,
+                    hermes_home=profile_home,
+                    environment=os.environ,
+                )
+            ),
             debounce_ticks=config.incident_debounce_ticks,
             activation_check=lambda: activation_verdict(
                 load_activation_inputs(

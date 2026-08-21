@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,7 @@ from skynet_cyclops.errors import (
     ValidationError,
 )
 from skynet_cyclops.ledger import Ledger
+from skynet_cyclops.manager import IncidentObservation
 from skynet_cyclops.manifest import canonical_manifest_hash, parse_manifest
 from skynet_cyclops.tick import run_tick
 
@@ -295,6 +297,53 @@ def test_cli_manager_router_denies_task_scope_and_courier_is_silent(
     assert capsys.readouterr().out == ""
 
 
+@pytest.mark.parametrize("home_kind", ["missing", "unsafe"])
+def test_cli_manager_missing_or_unsafe_profile_denies_before_lease_and_budget(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    home_kind: str,
+) -> None:
+    manifest_path = write_manifest(tmp_path / "mission.yaml")
+    config = config_file(tmp_path, manifest_path)
+    if home_kind == "unsafe":
+        (tmp_path / ".hermes").mkdir(mode=0o750)
+    incident = IncidentObservation(
+        mission_id="synthetic-release",
+        phase_key="verify",
+        kind="phase_failed",
+        subject_task_id="c",
+        subject_run_id=None,
+        severity="critical",
+        observation_sha256="a" * 64,
+        expected_state="done",
+        observed_state="failed",
+    )
+    with Ledger.create(tmp_path / "state" / "ledger.db") as ledger:
+        ledger.register_mission("synthetic-release", "b" * 64)
+        ledger.observe_manager_incidents([incident], tick_seq=1, now=100.0)
+        ledger.observe_manager_incidents([incident], tick_seq=2, now=101.0)
+
+    inputs = type(
+        "Inputs",
+        (),
+        {"jobs": {"router": {"job_id": "job-router"}, "courier": {"job_id": "job-courier"}}},
+    )()
+    monkeypatch.setattr(cli, "manager_scope_denied", lambda _environment: False)
+    monkeypatch.setattr(cli, "load_activation_inputs", lambda **_kwargs: inputs)
+    monkeypatch.setattr(
+        cli,
+        "activation_verdict",
+        lambda _inputs: ActivationVerdict("supported", "supported", True),
+    )
+
+    assert main(["manager", "router", "--config", str(config)]) == ExitCode.INVALID_INPUT
+    assert "Hermes result home" in capsys.readouterr().err
+    with Ledger.open(tmp_path / "state" / "ledger.db") as ledger:
+        assert ledger.current_manager_attempt() is None
+        assert ledger.manager_budget("synthetic-release", "1970-01-01") == 0
+
+
 def test_cli_manager_activate_and_deactivate_are_dry_run_first(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -357,6 +406,8 @@ def test_router_and_tick_use_configured_profile_not_ambient_hermes_home(
     configured_home.mkdir(mode=0o700)
     ambient_home = tmp_path / "ambient" / ".hermes" / "profiles" / "other"
     monkeypatch.setenv("HERMES_HOME", str(ambient_home))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "must-be-removed")
+    monkeypatch.setenv("HERMES_DELEGATION_PARENT", "must-also-be-removed")
     observed: list[Path] = []
 
     def load_current(**kwargs: object) -> object:
@@ -395,17 +446,26 @@ def test_router_and_tick_use_configured_profile_not_ambient_hermes_home(
             return ("collected", lease_acquired_at)
 
     class FakeCollector:
-        def __init__(self, _adapter: object) -> None:
-            pass
+        def __init__(self, adapter: object) -> None:
+            environment = adapter.environment  # type: ignore[attr-defined]
+            assert environment["HERMES_HOME"] == str(configured_home)
+            assert environment["HERMES_HOME"] != os.environ["HERMES_HOME"]
+            assert "HERMES_KANBAN_TASK" not in environment
+            assert "HERMES_DELEGATION_PARENT" not in environment
+            self.configured = environment["HERMES_HOME"] == str(configured_home)
 
         def collect(self, _board: str, _task_ids: list[str]) -> dict[str, object]:
-            return {}
+            return {"configured_profile": self.configured}
 
     monkeypatch.setattr(cli, "manager_router_gate", route_with_activation)
     monkeypatch.setattr(cli, "manager_scope_denied", lambda _environment: False)
     monkeypatch.setattr(cli, "HermesCronResultAdapter", FakeResultAdapter)
     monkeypatch.setattr(cli, "ReadOnlyCollector", FakeCollector)
-    monkeypatch.setattr(cli, "incident_observations", lambda *_args: [synthetic_incident])
+    monkeypatch.setattr(
+        cli,
+        "incident_observations",
+        lambda _manifest, _bindings, raw: [synthetic_incident] if raw["configured_profile"] else [],
+    )
     monkeypatch.setattr(cli, "stable_incident_id", lambda _incident: "incident-current")
     assert main(["manager", "router", "--config", str(config)]) == ExitCode.OK
     assert json.loads(capsys.readouterr().out) == {"wakeAgent": False}
@@ -545,6 +605,7 @@ def test_cli_bootstrap_apply_creates_missing_ledger_and_tick_status_text(
 ) -> None:
     manifest_path = write_manifest(tmp_path / "mission.yaml")
     config = config_file(tmp_path, manifest_path)
+    (tmp_path / ".hermes").mkdir(mode=0o700)
     expected = {"build": "task-1", "review": "task-2", "verify": "task-3"}
     monkeypatch.setattr(cli, "apply_bootstrap", lambda *_args: expected)
     assert (

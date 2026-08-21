@@ -8,8 +8,10 @@ import re
 import subprocess  # Used only for validated argv with shell=False.  # nosec B404
 import time
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
+from .config import canonical_private_hermes_home
 from .errors import AdapterError, ValidationError
 
 _SAFE_ENV = frozenset({"PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR"})
@@ -381,6 +383,7 @@ class HermesAdapter:
         collection_timeout_seconds: int = 30,
         max_output_bytes: int = 1024 * 1024,
         environment: Mapping[str, str] | None = None,
+        hermes_home: Path | None = None,
     ) -> None:
         if not binary or len(binary) > 4096 or "\x00" in binary:
             raise ValidationError("Hermes binary is invalid")
@@ -395,6 +398,8 @@ class HermesAdapter:
         self.collection_timeout_seconds = collection_timeout_seconds
         self.max_output_bytes = max_output_bytes
         self.environment = sanitize_environment(environment)
+        if hermes_home is not None:
+            self.environment["HERMES_HOME"] = str(canonical_private_hermes_home(hermes_home))
 
     def _run(self, arguments: list[str], *, deadline: float | None = None) -> str:
         if (

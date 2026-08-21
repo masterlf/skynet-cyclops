@@ -41,6 +41,78 @@ def test_environment_strips_authority_and_secrets(tmp_path: Path) -> None:
     assert env == {"PATH": "/usr/bin", "HOME": synthetic_home, "LANG": "C.UTF-8"}
 
 
+def test_adapter_uses_only_configured_private_hermes_home_after_sanitization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configured = tmp_path / "configured" / ".hermes"
+    ambient = tmp_path / "ambient" / ".hermes"
+    configured.mkdir(parents=True, mode=0o700)
+    ambient.mkdir(parents=True, mode=0o700)
+    observed: list[dict[str, str]] = []
+
+    def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        environment = kwargs["env"]
+        observed.append(environment)
+        status = "failed" if environment["HERMES_HOME"] == str(configured) else "done"
+        payload = {
+            "task": {
+                "id": "same-task",
+                "title": "Same synthetic task",
+                "assignee": "builder",
+                "status": status,
+            },
+            "latest_summary": None,
+            "parents": [],
+            "children": [],
+            "comments": [],
+            "events": [],
+            "runs": [],
+        }
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    configured_adapter = HermesAdapter(
+        hermes_home=configured,
+        environment={
+            "HOME": str(tmp_path / "ambient"),
+            "HERMES_HOME": str(ambient),
+            "HERMES_KANBAN_TASK": "must-be-removed",
+            "HERMES_DELEGATION_PARENT": "must-also-be-removed",
+        },
+    )
+    ambient_adapter = HermesAdapter(
+        hermes_home=ambient,
+        environment={"HOME": str(tmp_path / "configured"), "HERMES_HOME": str(configured)},
+    )
+
+    configured_task, _runs, _parents = configured_adapter.show_task("default", "same-task")
+    ambient_task, _runs, _parents = ambient_adapter.show_task("default", "same-task")
+
+    assert configured_task["id"] == ambient_task["id"] == "same-task"
+    assert configured_task["status"] == "failed"
+    assert ambient_task["status"] == "done"
+    assert observed[0]["HERMES_HOME"] == str(configured)
+    assert observed[1]["HERMES_HOME"] == str(ambient)
+    assert "HERMES_KANBAN_TASK" not in observed[0]
+    assert "HERMES_DELEGATION_PARENT" not in observed[0]
+
+
+@pytest.mark.parametrize("kind", ["missing", "permissions", "symlink"])
+def test_adapter_rejects_missing_or_unsafe_hermes_home(tmp_path: Path, kind: str) -> None:
+    home = tmp_path / "profile" / ".hermes"
+    if kind == "permissions":
+        home.mkdir(parents=True, mode=0o700)
+        home.chmod(0o750)
+    elif kind == "symlink":
+        target = tmp_path / "target" / ".hermes"
+        target.mkdir(parents=True, mode=0o700)
+        home.parent.mkdir(parents=True)
+        home.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(ValidationError, match="Hermes profile"):
+        HermesAdapter(hermes_home=home)
+
+
 def test_adapter_argv_shell_false_timeout_and_output_bound(monkeypatch: pytest.MonkeyPatch) -> None:
     observed: dict[str, Any] = {}
 
