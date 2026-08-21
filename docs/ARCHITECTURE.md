@@ -22,7 +22,7 @@ The manifest is immutable runtime intent: mission ID, phases, dependencies, role
 
 ### Bootstrap
 
-Bootstrap validates the complete graph before creating cards. Creation uses deterministic idempotency keys, a bounded machine-readable card contract, and supported Hermes CLI calls. Apply holds a private cross-process exclusive lock, rejects ambiguous or mismatched cards, creates every card blocked, verifies the complete graph, and then promotes roots. `--dry-run` is the default posture; `--apply` is explicit.
+Bootstrap validates the complete graph before creating cards. Creation uses deterministic idempotency keys, a bounded machine-readable card contract, and supported Hermes CLI calls. Apply holds a private cross-process exclusive lock, rejects ambiguous or mismatched cards, creates every card as `todo`, verifies every card identity and the complete dependency graph, and then promotes only roots. `--dry-run` is the default posture; `--apply` is explicit.
 
 ### Kanban
 

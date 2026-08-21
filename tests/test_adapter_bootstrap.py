@@ -545,7 +545,7 @@ def test_adapter_matches_live_cli_shapes_and_exact_argv(
     assert observed[3][:5] == ["hermes", "kanban", "--board", "default", "create"]
     assert "--body" in observed[3]
     assert observed[3][observed[3].index("--idempotency-key") + 1] == "cyclops-key"
-    assert observed[3][observed[3].index("--initial-status") + 1] == "blocked"
+    assert observed[3][observed[3].index("--initial-status") + 1] == "todo"
     assert observed[3][observed[3].index("--max-runtime") + 1] == "600"
     assert observed[3][observed[3].index("--max-retries") + 1] == "2"
     assert "--goal" in observed[3]
@@ -664,6 +664,57 @@ def test_collection_never_uses_stale_or_failed_run_evidence() -> None:
     assert [run["id"] for run in collection["runs"]] == ["1", "2"]  # type: ignore[index]
 
 
+def test_administrative_null_run_metadata_is_normalized_but_other_non_mappings_fail() -> None:
+    run = _raw_run(
+        id=7,
+        status="blocked",
+        outcome="blocked",
+        ended_at=1787279228,
+        metadata=None,
+    )
+    assert normalize_run_rows([run], "task-1") == [
+        {
+            "id": "7",
+            "task_id": "task-1",
+            "status": "blocked",
+            "heartbeat_age_seconds": None,
+            "retry_count": 0,
+            "_evidence": [],
+        }
+    ]
+    for malformed in ([], "", 0, False):
+        with pytest.raises(ValidationError, match="metadata"):
+            normalize_run_rows([{**run, "metadata": malformed}], "task-1")
+
+
+def test_live_shaped_administrative_block_run_is_collectable() -> None:
+    detail = _task_detail()
+    detail["task"] = _raw_task(status="blocked")
+    detail["runs"] = [
+        _raw_run(
+            id=45,
+            status="blocked",
+            outcome="blocked",
+            ended_at=1787279228,
+            metadata=None,
+        )
+    ]
+    responses = [detail, []]
+    adapter = HermesAdapter()
+    adapter._run_json = lambda *_args, **_kwargs: responses.pop(0)  # type: ignore[method-assign]
+    collection = adapter.collect("default", ["task-1"])
+    assert collection["tasks"][0]["status"] == "blocked"  # type: ignore[index]
+    assert collection["runs"] == [
+        {
+            "id": "45",
+            "task_id": "task-1",
+            "status": "blocked",
+            "heartbeat_age_seconds": None,
+            "retry_count": 0,
+        }
+    ]
+
+
 class FakeAdapter:
     def __init__(self, *, lose_first_response: bool = False) -> None:
         self.tasks: list[dict[str, Any]] = []
@@ -700,7 +751,7 @@ class FakeAdapter:
             "id": f"task-{len(self.tasks) + 1}",
             "title": title,
             "assignee": assignee,
-            "status": "blocked",
+            "status": "todo",
             "bootstrap_key": idempotency_key,
             "bootstrap_contract": {
                 "schema_version": 1,
@@ -722,7 +773,7 @@ class FakeAdapter:
         return task
 
     def link_tasks(self, board: str, parent_id: str, child_id: str) -> None:
-        assert all(task["status"] == "blocked" for task in self.tasks)
+        assert all(task["status"] == "todo" for task in self.tasks)
         self.calls.append(("link", board, parent_id, child_id))
         if parent_id not in self.parents[child_id]:
             self.parents[child_id].append(parent_id)
@@ -737,8 +788,18 @@ class FakeAdapter:
     def promote_task(self, board: str, task_id: str) -> None:
         assert self.parents["task-2"] == ["task-1"]
         assert self.parents["task-3"] == ["task-2"]
+        assert all(task["status"] == "todo" for task in self.tasks if task["id"] != task_id)
         self.promoted.append(task_id)
         next(task for task in self.tasks if task["id"] == task_id)["status"] = "ready"
+
+    def complete_task(self, task_id: str) -> None:
+        next(task for task in self.tasks if task["id"] == task_id)["status"] = "done"
+        for child_id, parents in self.parents.items():
+            if parents and all(
+                next(task for task in self.tasks if task["id"] == parent)["status"] == "done"
+                for parent in parents
+            ):
+                next(task for task in self.tasks if task["id"] == child_id)["status"] = "ready"
 
 
 def _item_contract(item: Any) -> dict[str, object]:
@@ -787,6 +848,16 @@ def test_bootstrap_apply_is_idempotent_and_reconciles_response_loss(tmp_path: Pa
     assert os.stat(tmp_path / "ledger.db").st_mode & 0o777 == 0o600
 
 
+def test_bootstrap_children_remain_todo_until_parent_completion(tmp_path: Path) -> None:
+    adapter = FakeAdapter()
+    manifest = parse_manifest(manifest_data())
+    with Ledger.create(tmp_path / "ledger.db") as ledger:
+        apply_bootstrap(manifest, adapter, ledger)
+    assert [task["status"] for task in adapter.tasks] == ["ready", "todo", "todo"]
+    adapter.complete_task("task-1")
+    assert [task["status"] for task in adapter.tasks] == ["done", "ready", "todo"]
+
+
 def test_invalid_graph_causes_no_profile_or_create_calls(tmp_path: Path) -> None:
     data = manifest_data()
     data["phases"][0]["depends_on"] = ["missing"]
@@ -822,7 +893,7 @@ def test_graph_verification_failure_never_promotes(tmp_path: Path) -> None:
     with Ledger.create(tmp_path / "ledger.db") as ledger, pytest.raises(AdapterError):
         apply_bootstrap(manifest, adapter, ledger)
     assert adapter.promoted == []
-    assert all(task["status"] == "blocked" for task in adapter.tasks)
+    assert all(task["status"] == "todo" for task in adapter.tasks)
 
 
 def test_bootstrap_reuses_preexisting_idempotent_card_without_duplicate_creation(
@@ -836,7 +907,7 @@ def test_bootstrap_reuses_preexisting_idempotent_card_without_duplicate_creation
             "id": "task-1",
             "title": first_item.title,
             "assignee": first_item.assignee,
-            "status": "blocked",
+            "status": "todo",
             "bootstrap_key": first_item.idempotency_key,
             "bootstrap_contract": first_item.contract(),
         }
@@ -867,7 +938,7 @@ def test_bootstrap_never_adopts_or_promotes_mismatched_preseeded_card(
         "id": "task-seeded",
         "title": item.title,
         "assignee": item.assignee,
-        "status": "blocked",
+        "status": "todo",
         "bootstrap_key": item.idempotency_key,
         "bootstrap_contract": _item_contract(item),
     }
@@ -894,7 +965,7 @@ def test_bootstrap_rejects_ambiguous_preseeded_candidates_before_binding(tmp_pat
                 "id": task_id,
                 "title": item.title,
                 "assignee": item.assignee,
-                "status": "blocked",
+                "status": "todo",
                 "bootstrap_key": item.idempotency_key,
                 "bootstrap_contract": _item_contract(item),
             }
@@ -958,6 +1029,26 @@ def test_bootstrap_reconciles_lost_link_and_promote_responses(tmp_path: Path) ->
         bindings = apply_bootstrap(manifest, adapter, ledger)
     assert bindings == {"build": "task-1", "review": "task-2", "verify": "task-3"}
     assert adapter.promoted == ["task-1"]
+
+
+def test_full_graph_readback_revalidates_card_contract_before_root_promotion(
+    tmp_path: Path,
+) -> None:
+    class DriftAfterLinkAdapter(FakeAdapter):
+        def list_tasks(self, board: str) -> list[dict[str, Any]]:
+            rows = super().list_tasks(board)
+            if self.parents.get("task-3") == ["task-2"]:
+                next(task for task in self.tasks if task["id"] == "task-2")["title"] = "drifted"
+            return rows
+
+    adapter = DriftAfterLinkAdapter()
+    manifest = parse_manifest(manifest_data())
+    with (
+        Ledger.create(tmp_path / "ledger.db") as ledger,
+        pytest.raises(AdapterError, match="match"),
+    ):
+        apply_bootstrap(manifest, adapter, ledger)
+    assert adapter.promoted == []
 
 
 def test_bootstrap_hard_link_failure_and_unexpected_edge_never_promote(tmp_path: Path) -> None:

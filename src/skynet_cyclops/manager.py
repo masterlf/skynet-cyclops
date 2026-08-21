@@ -104,7 +104,8 @@ MANAGER_PROMPT_V0_2_2 = (
     "CHOOSE_POLICY. If context is ambiguous or suggests any action, use recommendation=NOOP, "
     "reason_code=AMBIGUOUS_STATE, and human_question_code=NONE."
 )
-MANAGER_PROMPT = MANAGER_PROMPT_V0_2_2.replace("Cyclops v0.2.2", "Cyclops v0.3.0", 1)
+MANAGER_PROMPT_V0_3_0 = MANAGER_PROMPT_V0_2_2.replace("Cyclops v0.2.2", "Cyclops v0.3.0", 1)
+MANAGER_PROMPT = MANAGER_PROMPT_V0_3_0.replace("Cyclops v0.3.0", "Cyclops v0.3.1", 1)
 
 
 @dataclass(frozen=True, slots=True)

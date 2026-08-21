@@ -91,6 +91,31 @@ def test_incident_debounce_and_post_gap_observe_only(tmp_path: Path) -> None:
     assert "actions" not in json.dumps(gap)
 
 
+def test_blocked_task_collection_creates_and_revalidates_same_incident(tmp_path: Path) -> None:
+    manifest = parse_manifest(manifest_data())
+    ledger_path = tmp_path / "ledger.db"
+    status_path = tmp_path / "status.json"
+    with Ledger.create(ledger_path) as ledger:
+        ledger.register_mission(manifest.mission.id, canonical_manifest_hash(manifest))
+        for phase, task_id in (("build", "a"), ("review", "b"), ("verify", "c")):
+            ledger.bind(manifest.mission.id, phase, task_id, f"key-{phase}")
+    collector = Collector(
+        [
+            {"id": "a", "status": "blocked", "evidence": [], "retry_count": 0},
+            {"id": "b", "status": "todo", "evidence": [], "retry_count": 0},
+            {"id": "c", "status": "todo", "evidence": [], "retry_count": 0},
+        ]
+    )
+    first = run_tick(manifest, ledger_path, status_path, collector, now=1000.0)
+    second = run_tick(manifest, ledger_path, status_path, collector, now=1001.0)
+    blocked_first = next(item for item in first["incidents"] if item["phase_key"] == "build")
+    blocked_second = next(item for item in second["incidents"] if item["phase_key"] == "build")
+    assert blocked_first["kind"] == "phase_blocked"
+    assert blocked_second["id"] == blocked_first["id"]
+    assert blocked_second["observed_ticks"] == 2
+    assert blocked_second["disposition"] == "active"
+
+
 def test_collection_failure_does_not_advance_tick_gap_or_debounce_state(tmp_path: Path) -> None:
     manifest = parse_manifest(manifest_data())
     ledger_path = tmp_path / "ledger.db"
@@ -258,7 +283,7 @@ def test_cli_manager_install_dry_run_emits_spec_and_apply_only_stages(
     assert main(arguments) == ExitCode.OK
     spec = json.loads(capsys.readouterr().out)
     assert spec["protocol"] == "cyclops-cron-install/v1"
-    assert spec["release"] == "0.3.0"
+    assert spec["release"] == "0.3.1"
     snapshot = tmp_path / "snapshot.json"
     snapshot.write_text("[]\n", encoding="utf-8")
     profile = tmp_path / ".hermes"

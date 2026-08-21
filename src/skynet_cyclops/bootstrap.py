@@ -87,18 +87,24 @@ def plan_bootstrap(manifest: Manifest) -> tuple[BootstrapItem, ...]:
     )
 
 
-def _task_matches_item(task: dict[str, Any], item: BootstrapItem) -> bool:
+def _task_matches_item(
+    task: dict[str, Any], item: BootstrapItem, *, require_todo: bool = True
+) -> bool:
     return (
         task.get("bootstrap_key") == item.idempotency_key
         and task.get("title") == item.title
         and task.get("assignee") == item.assignee
-        and task.get("status") == "blocked"
+        and (not require_todo or task.get("status") == "todo")
         and task.get("bootstrap_contract") == item.contract()
     )
 
 
 def _select_candidate(
-    tasks: list[dict[str, Any]], item: BootstrapItem, *, reconciliation: bool
+    tasks: list[dict[str, Any]],
+    item: BootstrapItem,
+    *,
+    reconciliation: bool,
+    require_todo: bool = True,
 ) -> str | None:
     matches = [
         task
@@ -110,7 +116,7 @@ def _select_candidate(
         raise AdapterError(f"Hermes bootstrap card {context} is ambiguous")
     if not matches:
         return None
-    if not _task_matches_item(matches[0], item):
+    if not _task_matches_item(matches[0], item, require_todo=require_todo):
         raise AdapterError("Hermes bootstrap card does not match the planned phase")
     return str(matches[0]["id"])
 
@@ -124,7 +130,7 @@ def _reconcile_created_task(
 def apply_bootstrap(
     manifest: Manifest, adapter: BootstrapAdapter, ledger: Ledger
 ) -> dict[str, str]:
-    """Create a blocked graph, verify all edges, then expose roots to the dispatcher."""
+    """Create a todo graph, verify all cards and edges, then expose only its roots."""
     with ledger.bootstrap_lock():
         return _apply_bootstrap_locked(manifest, adapter, ledger)
 
@@ -138,10 +144,12 @@ def _apply_bootstrap_locked(
     manifest_hash = canonical_manifest_hash(manifest)
     ledger.register_mission(manifest.mission.id, manifest_hash)
     bindings = ledger.bindings(manifest.mission.id)
+    planned_phases = {item.phase_key for item in plan}
+    graph_was_previously_bound = set(bindings) == planned_phases
 
     existing = adapter.list_tasks(manifest.mission.board)
 
-    # Stage 1: every card is created blocked and without edges. No ready window exists.
+    # Stage 1: every card is created todo and without edges. Hermes does not auto-promote todo.
     for item in plan:
         if item.phase_key in bindings:
             continue
@@ -179,7 +187,7 @@ def _apply_bootstrap_locked(
         ledger.complete_intent(item.idempotency_key)
         bindings[item.phase_key] = task_id
 
-    if set(bindings) != {item.phase_key for item in plan}:
+    if set(bindings) != planned_phases:
         raise AdapterError("Hermes bootstrap bindings are incomplete")
 
     # Stage 2: add every dependency. A lost response is reconciled by reading parents.
@@ -196,8 +204,17 @@ def _apply_bootstrap_locked(
                 if parent_id not in adapter.task_parents(manifest.mission.board, child_id):
                     raise
 
-    # Stage 3: exact read-back. No phase is promoted before this full-graph gate passes.
+    # Stage 3: exact card and edge read-back. No phase is promoted before this full-graph gate.
+    readback = adapter.list_tasks(manifest.mission.board)
     for item in plan:
+        task_id = _select_candidate(
+            readback,
+            item,
+            reconciliation=True,
+            require_todo=not graph_was_previously_bound,
+        )
+        if task_id != bindings[item.phase_key]:
+            raise AdapterError("Hermes bootstrap card identity verification failed")
         actual = set(adapter.task_parents(manifest.mission.board, bindings[item.phase_key]))
         expected = {bindings[key] for key in item.dependency_phases}
         if actual != expected:
@@ -208,8 +225,11 @@ def _apply_bootstrap_locked(
         if item.dependency_phases:
             continue
         task_id = bindings[item.phase_key]
-        if adapter.task_status(manifest.mission.board, task_id) in {"ready", "running", "done"}:
+        status = adapter.task_status(manifest.mission.board, task_id)
+        if status in {"ready", "running", "done"}:
             continue
+        if status != "todo":
+            raise AdapterError("Hermes bootstrap root is not eligible for promotion")
         try:
             adapter.promote_task(manifest.mission.board, task_id)
         except AdapterError:
